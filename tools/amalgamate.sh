@@ -51,7 +51,7 @@ int main(int argc, char **argv)
     UHalf i;
 
     if (argc < 2) {
-        fprintf(stderr, "usage: %s [--stack] file.dffi\n", argv[0]);
+        fprintf(stderr, "usage: %s [--stack] file.uffi\n", argv[0]);
         return 1;
     }
     if (argi < argc && strcmp(argv[argi], "--stack") == 0) {
@@ -59,7 +59,7 @@ int main(int argc, char **argv)
         argi++;
     }
     if (argi >= argc) {
-        fprintf(stderr, "usage: %s [--stack] file.dffi\n", argv[0]);
+        fprintf(stderr, "usage: %s [--stack] file.uffi\n", argv[0]);
         return 1;
     }
 
