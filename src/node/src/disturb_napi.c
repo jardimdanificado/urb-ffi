@@ -7,7 +7,7 @@
 #include <string.h>
 
 #define URBC_IMPLEMENTATION
-#include "../dist/urbc.h"
+#include "../../../dist/urbc.h"
 
 typedef struct CallbackBinding CallbackBinding;
 typedef struct AddonState {

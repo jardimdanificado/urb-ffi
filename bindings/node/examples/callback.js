@@ -1,5 +1,5 @@
 'use strict';
-const { ffi, memory: mem } = require('../../../');
+const { ffi, memory: mem } = require('../');
 
 // qsort via callback — JS comparator → C function pointer
 const libc = ffi.open('libc.so.6');

@@ -1,5 +1,5 @@
 'use strict';
-const { memory: mem } = require('../../../');
+const { memory: mem } = require('../');
 
 // alloc 4 bytes, write/read i32
 let p = mem.alloc(4n);

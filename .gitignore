@@ -1,4 +1,4 @@
 /dist/urbc.h
 /dist/urbccli.c
-/dist/*.node
-/dist/*.o
+/dist/*.so
+/bindings/node/dist/

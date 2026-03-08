@@ -1,5 +1,5 @@
 'use strict';
-const { ffi, memory: mem } = require('../../../');
+const { ffi, memory: mem } = require('../');
 
 console.log('urb-ffi ffi.sym_self demo');
 

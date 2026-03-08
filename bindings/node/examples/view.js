@@ -1,5 +1,5 @@
 'use strict';
-const { ffi, memory: mem } = require('../../../');
+const { ffi, memory: mem } = require('../');
 
 // struct Point { i32 x; i32 y; f64 value; u64 flags; }
 const PointSchema = {

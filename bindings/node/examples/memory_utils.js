@@ -1,5 +1,5 @@
 'use strict';
-const { ffi, memory: mem } = require('../../../');
+const { ffi, memory: mem } = require('../');
 
 // realloc
 let p = mem.alloc(8n);

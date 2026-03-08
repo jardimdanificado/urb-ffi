@@ -2,9 +2,8 @@ NODE ?= node
 NODE_PREFIX ?=
 ROOT := $(abspath ../..)
 AMALGAMATE := $(ROOT)/tools/amalgamate.sh
-DIST_DIR := $(CURDIR)/dist
-AMALGAMATED_HEADER := $(DIST_DIR)/urbc.h
-AMALGAMATED_CLI := $(DIST_DIR)/urbccli.c
+AMALGAMATED_HEADER := $(ROOT)/dist/urbc.h
+AMALGAMATED_CLI := $(ROOT)/dist/urbccli.c
 AMALGAMATE_INPUTS := $(AMALGAMATE) $(ROOT)/include/urb.h $(ROOT)/src/urbc_internal.h $(wildcard $(ROOT)/include/urbc/*.h) $(wildcard $(ROOT)/src/*.c)
 NODE_BIN := $(shell command -v $(NODE) 2>/dev/null)
 NODE_INCLUDES ?= $(shell \
@@ -37,34 +36,18 @@ CPPFLAGS ?= -DBUILDING_NODE_EXTENSION -I$(NODE_INCLUDES) $(FFI_CFLAGS)
 LDFLAGS ?= -shared -fPIC -pthread
 LDLIBS ?= $(FFI_LIBS) -ldl -lm
 
-SRCS = src/urb_ffi_napi.c
-OBJS = $(patsubst src/%.c, $(DIST_DIR)/%.o, $(SRCS))
-TARGET = $(DIST_DIR)/urb-ffi.node
+SRCS = src/disturb_napi.c
+OBJS = $(patsubst src/%.c, build/%.o, $(SRCS))
+TARGET = build/disturb.node
 
-.PHONY: all clean test sync-dist ensure-dist
+.PHONY: all clean test
 
-all: ensure-dist $(TARGET)
+all: $(TARGET)
 
-sync-dist: | $(DIST_DIR)/
-	@if [ ! -x "$(AMALGAMATE)" ] || [ ! -f "$(ROOT)/include/urb.h" ]; then \
-		echo "sync-dist requires the urb-ffi repository root" >&2; \
-		exit 1; \
-	fi
+$(AMALGAMATED_HEADER) $(AMALGAMATED_CLI): $(AMALGAMATE_INPUTS)
 	$(AMALGAMATE)
-	cp "$(ROOT)/dist/urbc.h" "$(AMALGAMATED_HEADER)"
-	cp "$(ROOT)/dist/urbccli.c" "$(AMALGAMATED_CLI)"
 
-ensure-dist:
-	@if [ ! -f "$(AMALGAMATED_HEADER)" ] || [ ! -f "$(AMALGAMATED_CLI)" ]; then \
-		if [ -x "$(AMALGAMATE)" ] && [ -f "$(ROOT)/include/urb.h" ]; then \
-			$(MAKE) sync-dist; \
-		else \
-			echo "missing dist/urbc.h and dist/urbccli.c; publish must include them" >&2; \
-			exit 1; \
-		fi; \
-	fi
-
-$(DIST_DIR)/%.o: src/%.c $(AMALGAMATED_HEADER) | $(DIST_DIR)/
+build/%.o: src/%.c $(AMALGAMATED_HEADER) | build/
 	@echo "[CC] $<"
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
@@ -72,11 +55,11 @@ $(TARGET): $(OBJS)
 	@echo "[LD] $(TARGET)"
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
-$(DIST_DIR)/:
-	mkdir -p $(DIST_DIR)
+build/:
+	mkdir -p build
 
 clean:
-	rm -rf $(DIST_DIR)
+	rm -rf build/
 
 test: all
 	@echo "=== hello ===" && $(NODE) examples/hello.js

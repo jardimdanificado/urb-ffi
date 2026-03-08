@@ -1,5 +1,5 @@
 'use strict';
-const { ffi, memory: mem } = require('../../../');
+const { ffi, memory: mem } = require('../');
 
 // ── 1. __pointer — campo tratado como ponteiro nativo ─────────────────────────
 const NodeSchema = {
