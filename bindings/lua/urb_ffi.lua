@@ -2,24 +2,30 @@ local function dirname(path)
     return path:match("^(.*)/[^/]+$") or "."
 end
 
-local function module_root()
+local function module_dir()
     local source = debug.getinfo(1, "S").source
     if source:sub(1, 1) ~= "@" then
         error("urb_ffi.lua must be loaded from a file", 2)
     end
     local file = source:sub(2)
-    local lua_dir = dirname(file)
-    return dirname(dirname(lua_dir))
+    return dirname(file)
 end
 
 local function load_native()
-    local root = module_root()
-    local so_path = root .. "/dist/urb_ffi_native.so"
-    local loader, err = package.loadlib(so_path, "luaopen_urb_ffi_native")
-    if not loader then
-        error("failed to load " .. so_path .. ": " .. tostring(err), 2)
+    local lua_dir = module_dir()
+    local candidates = {
+        lua_dir .. "/urb_ffi_native.so",
+        dirname(dirname(lua_dir)) .. "/dist/urb_ffi_native.so",
+    }
+
+    for _, so_path in ipairs(candidates) do
+        local loader = package.loadlib(so_path, "luaopen_urb_ffi_native")
+        if loader then
+            return loader()
+        end
     end
-    return loader()
+
+    error("failed to load urb_ffi_native.so from known locations", 2)
 end
 
 local native = load_native()

@@ -1,422 +1,748 @@
-# URBC Bytecode Reference
+# urb-ffi
 
-This file documents the on-disk format and every executable token/opcode implemented by this repository.
+`urb-ffi` is a binding-first FFI toolkit built on top of the `urbc` runtime.
 
-## 1. Execution model
+The current project is centered on two host bindings:
 
-- VM style: stack machine.
-- Stack notation here uses **top on the right**.
-  - Example: `[a, b] -> [c]` means `b` is popped first.
-- Truthiness: any value with `v.i != 0` is true.
-- Program counter (`pc`) is an **absolute index inside loaded `mem`**, not code-relative.
-- `mem` layout after load:
-  - `mem[0 .. const_count-1]`: constants
-  - `mem[const_count .. const_count+code_count-1]`: code tokens
-- First executed instruction: `entry_pc = const_count`.
-- `max_stack` is used as the initial stack capacity; it is not a hard limit.
+- **Node.js**: a Node-API addon plus a JavaScript compatibility layer.
+- **Lua 5.4**: a native C module plus a high-level Lua wrapper.
 
-## 2. Global binary format
+If the goal is to call native code, exchange raw pointers, inspect C layouts, or expose host callbacks back to C, this is what `urb-ffi` is for.
 
-All integers are **little-endian**.
+## What urb-ffi can do
 
-### Header (`40` bytes)
+`urb-ffi` covers the full flow of native interop:
 
-| Offset | Size | Field | Meaning |
-|---:|---:|---|---|
-| 0 | 4 | magic | ASCII `DFFI` |
-| 4 | 1 | version_major | Must equal `1` |
-| 5 | 1 | version_minor | Informational |
-| 6 | 1 | profile | Must equal `1` (`URBC_PROFILE_URB64`) |
-| 7 | 1 | flags | Must be `0` |
-| 8 | 2 | max_stack | Initial stack capacity |
-| 10 | 2 | string_count | Number of strings |
-| 12 | 2 | signature_count | Number of signatures |
-| 14 | 2 | schema_count | Number of schemas |
-| 16 | 2 | const_count | Number of constants |
-| 18 | 2 | code_count | Number of code tokens |
-| 20 | 4 | string_bytes | Byte size of string section |
-| 24 | 4 | signature_bytes | Byte size of signature section |
-| 28 | 4 | schema_bytes | Byte size of schema section |
-| 32 | 4 | const_bytes | Byte size of constant section |
-| 36 | 4 | code_bytes | Byte size of code section |
+1. **Open shared libraries** with `dlopen`-style flags.
+2. **Resolve symbols** from a library or from the current process.
+3. **Bind C function signatures** and call them from Node or Lua.
+4. **Call variadic C functions**.
+5. **Create native callbacks** so C code can call back into JavaScript or Lua.
+6. **Read and write raw memory** with typed helpers.
+7. **Allocate, resize, clear, copy, compare, and free native buffers**.
+8. **Read and write C strings**.
+9. **Read and write pointers directly**.
+10. **Marshal arrays of primitive values**.
+11. **Describe C structs and unions in the host language**.
+12. **Compute `sizeof` and `offsetof` from host-side schemas**.
+13. **Create live struct views over native memory**.
+14. **Create array-of-struct views**.
+15. **Handle nested structs, unions, fixed arrays, and pointer fields**.
+16. **Inspect `errno` and the last dynamic-loader error**.
 
-### Section order
+## Runtime status
 
-1. header
-2. string section
-3. signature section
-4. schema section
-5. constant section
-6. code section
+- **Node.js**: primary packaged binding, `node >= 12.17`.
+- **Lua 5.4**: native binding and examples included in the repository.
+- **Windows**: Node build path is prepared through `node-gyp`; Lua examples and packaging are still Unix-oriented.
 
-## 3. Section encodings
+## Repository layout
 
-### 3.1 Strings
+- [bindings/node](bindings/node): Node binding
+- [bindings/lua](bindings/lua): Lua 5.4 binding
+- [include](include): public C headers used by the bindings
+- [src](src): `urbc` implementation used by the bindings
+- [docs/BYTECODE.md](docs/BYTECODE.md): bytecode/runtime documentation
 
-Repeated `string_count` times:
+## Build and package targets
 
-| Field | Size | Meaning |
-|---|---:|---|
-| `len` | 2 | String byte length |
-| `bytes` | `len` | Raw bytes, no trailing `\0` in file |
+From the repository root:
 
-Runtime copies each string and appends `\0` in memory.
+- `npm install` or `npm run build`: build the Node addon
+- `npm test`: run the Node examples/tests
+- `make node`: assemble a self-contained Node module folder in `dist/node`
+- `make lua`: assemble a self-contained Lua module folder in `dist/lua`
+- `make modules`: build both packaged binding folders
 
-### 3.2 Signatures
+The generated folders are intended to look like distributable binding packages:
 
-Repeated `signature_count` times:
+- `dist/node`
+- `dist/lua`
 
-| Field | Size | Meaning |
-|---|---:|---|
-| `string_index` | 2 | Index into string table |
+## Installing the bindings
 
-A signature entry is only an indirection to a string.
+### Node.js
 
-### 3.3 Schemas
+From the repository root:
 
-Schemas are packed back-to-back.
+```bash
+npm install
+```
 
-#### Schema header (`4` bytes)
+That builds the native addon from source.
 
-| Field | Size | Meaning |
-|---|---:|---|
-| `schema_kind` | 1 | `0=struct`, `1=union` |
-| `reserved` | 1 | Must be `0` |
-| `field_count` | 2 | Number of fields |
+Requirements:
 
-#### Schema field (`10` bytes each)
+- Node.js `>= 12.17`
+- a C toolchain
+- `libffi`
 
-| Field | Size | Meaning |
-|---|---:|---|
-| `name_index` | 2 | Index into string table |
-| `field_kind` | 1 | See field kinds below |
-| `prim_type` | 1 | Primitive type id |
-| `aux` | 2 | Field-specific extra data |
-| `ref_schema_index` | 2 | Nested schema index |
-| `reserved` | 2 | Must be `0` |
+On Linux and macOS, `libffi` is usually discovered with `pkg-config`.
 
-Field semantics:
+On Windows, set these before install if `libffi` is not auto-discovered:
 
-- `PRIM`: `prim_type` is required.
-- `ARRAY`: fixed array of primitives; `prim_type` is element type, `aux` is element count (`> 0`).
-- `STRUCT`: by-value nested schema; `ref_schema_index` is required.
-- `POINTER`: native pointer field; stored size/alignment is `sizeof(void*)`; other metadata is ignored.
-
-Layout rules:
-
-- Structs: fields are aligned one by one, offsets increase.
-- Unions: every field offset is `0`; size is max field size aligned to max field alignment.
-- Recursive by-value schemas are not supported.
-
-### 3.4 Constants
-
-Each constant starts with a `4`-byte wire header:
-
-| Field | Size | Meaning |
-|---|---:|---|
-| `kind` | 1 | Constant kind id |
-| `reserved` | 1 | Must be `0` |
-| `aux` | 2 | Kind-specific data |
-
-Payload depends on `kind`:
-
-| Kind | Id | Payload | Meaning |
-|---|---:|---|---|
-| `BOOL` | 0 | `u8` | `0` or non-zero |
-| `I64` | 1 | `i64` | Signed integer |
-| `U64` | 2 | `u64` | Unsigned integer |
-| `F64` | 3 | `f64` | Float |
-| `STRING` | 4 | none | `aux = string_index` |
-| `SIG` | 5 | none | `aux = signature_index` |
-| `SCHEMA` | 6 | none | `aux = schema_index` |
-| `NULLPTR` | 7 | none | Null pointer |
-
-Runtime form:
-
-- `STRING` becomes `char*`.
-- `SIG` becomes `char*` to the signature text.
-- `SCHEMA` becomes an owned schema-handle wrapper.
-- `NULLPTR` becomes `NULL`.
-
-### 3.5 Code tokens
-
-Each code entry is always `4` bytes:
-
-| Field | Size | Meaning |
-|---|---:|---|
-| `kind` | 1 | Token kind id |
-| `reserved` | 1 | Must be `0` |
-| `value` | 2 | Kind-specific value |
-
-Token kinds:
-
-| Kind | Id | `value` meaning |
-|---|---:|---|
-| `ALIAS` | 0 | Alias id |
-| `OP` | 1 | Opcode id |
-| `CONST_REF` | 2 | Constant index |
-
-Load-time lowering:
-
-- `ALIAS` -> `INT_MIN + alias_id`
-- `OP` -> `INT_MIN + 8 + op_id`
-- `CONST_REF` -> `INT_MAX - const_index`
-
-`CONST_REF` does **not** inline data; it pushes `mem[const_index]` at runtime.
-
-## 4. Enum ids used by bytecode
-
-### 4.1 Alias ids
-
-| Id | Name | Runtime effect |
-|---:|---|---|
-| 0 | `goto` | Pop target `pc`; jump there |
-| 1 | `goif` | Pop `cond`, then target; jump if true |
-| 2 | `goie` | Pop `cond`, then true-target, then else-target |
-| 3 | `exec` | Push the exec registry list pointer |
-| 4 | `mem` | Push the loaded memory list pointer |
-
-Important:
-
-- Jump targets are **absolute `mem` indexes**.
-- In raw stack form:
-  - `goto`: `[target] -> []`, then jump
-  - `goif`: `[target, cond] -> []`, then maybe jump
-  - `goie`: `[else_pc, true_pc, cond] -> []`, then jump
-
-### 4.2 Primitive type ids
-
-| Id | Name | Size/alignment |
-|---:|---|---|
-| 0 | `invalid` | invalid |
-| 1 | `bool` | 1 / 1 |
-| 2 | `i8` | 1 / 1 |
-| 3 | `u8` | 1 / 1 |
-| 4 | `i16` | 2 / 2 |
-| 5 | `u16` | 2 / 2 |
-| 6 | `i32` | 4 / 4 |
-| 7 | `u32` | 4 / 4 |
-| 8 | `i64` | 8 / 8 |
-| 9 | `u64` | 8 / 8 |
-| 10 | `f32` | 4 / 4 |
-| 11 | `f64` | 8 / 8 |
-| 12 | `pointer` | `sizeof(void*)` |
-| 13 | `cstring` | `sizeof(void*)` |
-
-### 4.3 Schema kind ids
-
-| Id | Name |
-|---:|---|
-| 0 | `struct` |
-| 1 | `union` |
-
-### 4.4 Field kind ids
-
-| Id | Name |
-|---:|---|
-| 0 | `prim` |
-| 1 | `array` |
-| 2 | `struct` |
-| 3 | `pointer` |
-
-## 5. Opcode reference
-
-Notes:
-
-- Stack notation uses top on the right.
-- `ptr` means native address stored in `Value.u`/`Value.p`.
-- Many memory ops are NULL-tolerant:
-  - reads from `NULL` return zero,
-  - writes/copies/sets on `NULL` do nothing.
-- On runtime failure, execution stops and `last_error` is filled.
-
-### 5.1 Core / stack / compare
-
-| Id | Name | Stack effect | Meaning |
-|---:|---|---|---|
-| 0 | `stack.dup` | `[x] -> [x, x]` | Duplicate top value |
-| 1 | `stack.pop` | `[x] -> []` | Discard top value |
-| 2 | `stack.swap` | `[a, b] -> [b, a]` | Swap top two |
-| 3 | `ptr.add` | `[ptr, offset] -> [ptr+offset]` | Pointer arithmetic; `offset` uses signed `.i` |
-| 4 | `ptr.sub` | `[a, b] -> [a-b]` | Unsigned subtraction, result stored as signed `.i` |
-| 5 | `cmp.eq` | `[a, b] -> [bool]` | Raw equality on `.u` |
-| 6 | `cmp.ne` | `[a, b] -> [bool]` | Raw inequality on `.u` |
-| 7 | `cmp.lt_i64` | `[a, b] -> [bool]` | Signed compare |
-| 8 | `cmp.le_i64` | `[a, b] -> [bool]` | Signed compare |
-| 9 | `cmp.gt_i64` | `[a, b] -> [bool]` | Signed compare |
-| 10 | `cmp.ge_i64` | `[a, b] -> [bool]` | Signed compare |
-| 11 | `logic.not` | `[x] -> [!truthy(x)]` | `truthy(x)` is `x.i != 0` |
-
-### 5.2 Memory opcodes
-
-| Id | Name | Stack effect | Meaning |
-|---:|---|---|---|
-| 20 | `mem.alloc` | `[size] -> [ptr]` | `malloc(size)` |
-| 21 | `mem.free` | `[ptr] -> []` | `free(ptr)` |
-| 22 | `mem.realloc` | `[ptr, size] -> [new_ptr]` | `realloc(ptr, size)` |
-| 23 | `mem.zero` | `[ptr, size] -> []` | `memset(ptr, 0, size)` |
-| 24 | `mem.copy` | `[dst, src, size] -> []` | `memcpy(dst, src, size)` |
-| 25 | `mem.set` | `[ptr, byte, size] -> []` | `memset(ptr, byte & 0xFF, size)` |
-| 26 | `mem.compare` | `[a, b, size] -> [result]` | `memcmp(a, b, size)` |
-| 27 | `mem.nullptr` | `[] -> [NULL]` | Push null pointer |
-| 28 | `mem.sizeof_ptr` | `[] -> [sizeof(void*)]` | Pointer size |
-| 29 | `mem.readptr` | `[ptr] -> [value]` | Read `uintptr_t` from memory |
-| 30 | `mem.writeptr` | `[ptr, value] -> []` | Write `uintptr_t` |
-| 31 | `mem.readcstring` | `[ptr] -> [cstring]` | Return same pointer as C string |
-| 32 | `mem.writecstring` | `[ptr, cstring] -> []` | Copy string plus trailing `\0` |
-| 33 | `mem.readi8` | `[ptr] -> [i8]` | Read `int8_t` |
-| 34 | `mem.readu8` | `[ptr] -> [u8]` | Read `uint8_t` |
-| 35 | `mem.readi16` | `[ptr] -> [i16]` | Read `int16_t` |
-| 36 | `mem.readu16` | `[ptr] -> [u16]` | Read `uint16_t` |
-| 37 | `mem.readi32` | `[ptr] -> [i32]` | Read `int32_t` |
-| 38 | `mem.readu32` | `[ptr] -> [u32]` | Read `uint32_t` |
-| 39 | `mem.readi64` | `[ptr] -> [i64]` | Read `int64_t` |
-| 40 | `mem.readu64` | `[ptr] -> [u64]` | Read `uint64_t` |
-| 41 | `mem.readf32` | `[ptr] -> [f32]` | Read `float` |
-| 42 | `mem.readf64` | `[ptr] -> [f64]` | Read `double` |
-| 43 | `mem.writei8` | `[ptr, i8] -> []` | Write `int8_t` |
-| 44 | `mem.writeu8` | `[ptr, u8] -> []` | Write `uint8_t` |
-| 45 | `mem.writei16` | `[ptr, i16] -> []` | Write `int16_t` |
-| 46 | `mem.writeu16` | `[ptr, u16] -> []` | Write `uint16_t` |
-| 47 | `mem.writei32` | `[ptr, i32] -> []` | Write `int32_t` |
-| 48 | `mem.writeu32` | `[ptr, u32] -> []` | Write `uint32_t` |
-| 49 | `mem.writei64` | `[ptr, i64] -> []` | Write `int64_t` |
-| 50 | `mem.writeu64` | `[ptr, u64] -> []` | Write `uint64_t` |
-| 51 | `mem.writef32` | `[ptr, f32] -> []` | Write `float` |
-| 52 | `mem.writef64` | `[ptr, f64] -> []` | Write `double` |
-
-### 5.3 Schema / view / union opcodes
-
-Schema operands are values produced from `CONST_SCHEMA` constants.
-
-| Id | Name | Stack effect | Meaning |
-|---:|---|---|---|
-| 60 | `schema.sizeof` | `[schema] -> [size]` | Compiled schema size |
-| 61 | `schema.offsetof` | `[schema, field_name] -> [offset]` | Field offset by name |
-| 62 | `view.make` | `[ptr, schema] -> [view]` | View over one struct/union at `ptr` |
-| 63 | `view.array` | `[ptr, schema, count] -> [array_view]` | Array view with stride `schema.size` |
-| 64 | `view.get` | `[handle, name] -> [value]` | Read field/property |
-| 65 | `view.set` | `[view, name, value] -> []` | Write primitive/pointer field |
-| 66 | `union.make` | `[ptr, schema] -> [view]` | Same as `view.make`, but schema must be union |
-| 67 | `union.sizeof` | `[schema] -> [size]` | Same as `schema.sizeof`, but union-only |
-
-`view.get` details:
-
-- On a normal view:
-  - primitive field -> pushes decoded value
-  - pointer field -> pushes pointer value
-  - primitive array field -> pushes raw base address of the array
-  - struct field -> pushes nested view
-- On an array view:
-  - name `"count"` -> element count
-  - name `"ptr"` -> base pointer
-  - name `"N"` -> element view at decimal index `N`
-
-`view.set` only accepts primitive and pointer fields.
-
-### 5.4 FFI opcodes
-
-Library open flags are numeric ORs of:
-
-| Flag | Value |
-|---|---:|
-| `URBC_DLOPEN_LAZY` | `1` |
-| `URBC_DLOPEN_NOW` | `2` |
-| `URBC_DLOPEN_LOCAL` | `4` |
-| `URBC_DLOPEN_GLOBAL` | `8` |
-| `URBC_DLOPEN_NODELETE` | `16` |
-| `URBC_DLOPEN_NOLOAD` | `32` |
-
-| Id | Name | Stack effect | Meaning |
-|---:|---|---|---|
-| 80 | `ffi.open` | `[path, flags] -> [handle]` | Open shared library; returns `NULL` on failure |
-| 81 | `ffi.close` | `[handle] -> []` | Close shared library handle |
-| 82 | `ffi.sym` | `[handle, name] -> [symbol_ptr]` | Resolve symbol from library |
-| 83 | `ffi.sym_self` | `[name] -> [symbol_ptr]` | Resolve symbol from current process |
-| 84 | `ffi.bind` | `[fn_ptr, sig] -> [bound_fn]` | Build libffi callable wrapper |
-| 85 | `ffi.call0` | `[bound_fn] -> [ret]` | Call bound function with 0 args |
-| 86 | `ffi.call1` | `[bound_fn, a0] -> [ret]` | Call with 1 arg |
-| 87 | `ffi.call2` | `[bound_fn, a0, a1] -> [ret]` | Call with 2 args |
-| 88 | `ffi.call3` | `[bound_fn, a0, a1, a2] -> [ret]` | Call with 3 args |
-| 89 | `ffi.call4` | `[bound_fn, a0, a1, a2, a3] -> [ret]` | Call with 4 args |
-| 90 | `ffi.callback` | `[sig, callable] -> [fn_ptr]` | Build native callback that calls a host binding |
-| 91 | `ffi.errno` | `[] -> [errno]` | Push current thread `errno` |
-| 92 | `ffi.dlerror` | `[] -> [cstring_or_null]` | Copy last dynamic-loader error |
-| 93 | `ffi.callv` | see below | Variadic/general call |
-
-Notes:
-
-- `ffi.open`, `ffi.sym`, `ffi.sym_self` do not raise runtime failure on lookup/open failure; check `ffi.dlerror`.
-- `ffi.call*` on a `void` function pushes a zeroed `Value`.
-- `ffi.callback` only targets **host bindings**, not bytecode closures.
-- Variadic callbacks are not supported.
-
-#### `ffi.callv`
-
-Stack form:
-
-`[bound_fn, arg0, ..., argN-1, vararg_kind0, ..., vararg_kindK-1, argc, extra] -> [ret]`
-
-Where:
-
-- `argc` = total argument count
-- `extra` = number of variadic arguments (`K`)
-- `vararg_kind*` are `URBC_PRIM_*` ids for the **last `extra` arguments**, in left-to-right argument order
-
-Example shape for a function with 2 fixed args and 2 variadic args:
-
-`[fn, fixed0, fixed1, var0, var1, kind(var0), kind(var1), 4, 2]`
-
-### 5.5 Host call opcodes
-
-Host call target may be:
-
-- a host binding pointer, or
-- a host binding name string
-
-| Id | Name | Stack effect | Meaning |
-|---:|---|---|---|
-| 100 | `host.call0` | `[callable] -> [ret]` | Host callback with 0 args |
-| 101 | `host.call1` | `[callable, a0] -> [ret]` | Host callback with 1 arg |
-| 102 | `host.call2` | `[callable, a0, a1] -> [ret]` | Host callback with 2 args |
-| 103 | `host.call3` | `[callable, a0, a1, a2] -> [ret]` | Host callback with 3 args |
-
-## 6. FFI signature strings
-
-`CONST_SIG` and `ffi.bind`/`ffi.callback` use a small C-like signature grammar.
-
-### Grammar
-
-`return_type name(arg0, arg1, ..., ...)`
-
-The function name is optional for binding purposes; parsing also accepts just a return type, or a return type plus a name without parentheses.
-
-### Supported base types
+- `LIBFFI_INCLUDE_DIR`
+- `LIBFFI_LIB_DIR`
+- optional `LIBFFI_LIB_NAME`
+- or `LIBFFI_LIBS`
+
+### Lua 5.4
+
+From the repository root:
+
+```bash
+make lua
+```
+
+Or build directly inside the binding folder:
+
+```bash
+make -C bindings/lua
+```
+
+If Lua headers and libraries are not in a standard location, the Lua binding accepts:
+
+- `LUA_PREFIX=/path/to/lua`
+- `LUA_INCLUDES=/path/to/lua/include`
+- `LUA_CFLAGS='-I/path/to/lua/include'`
+- `LUA_LIBS='-L/path/to/lua/lib -llua5.4'`
+
+## Quick start
+
+### Node.js: open a library, bind functions, call them
+
+```js
+const { ffi } = require('urb-ffi');
+
+const libcName = process.platform === 'darwin'
+  ? '/usr/lib/libSystem.B.dylib'
+  : process.platform === 'win32'
+    ? 'ucrtbase.dll'
+    : 'libc.so.6';
+
+const libc = ffi.open(libcName, ffi.flags.NOW | ffi.flags.LOCAL);
+const puts = ffi.bind(ffi.sym(libc, 'puts'), 'i32 puts(cstring)');
+const getenv = ffi.bind(ffi.sym(libc, 'getenv'), 'cstring getenv(cstring)');
+
+puts('hello from urb-ffi');
+console.log('HOME =', getenv('HOME'));
+
+ffi.close(libc);
+```
+
+### Lua 5.4: call `qsort` with a Lua callback
+
+```lua
+local urb = require('urb_ffi')
+local ffi, mem = urb.ffi, urb.memory
+
+local libc = ffi.open('libc.so.6')
+local qsort = ffi.bind(ffi.sym(libc, 'qsort'), 'void qsort(pointer, u64, u64, pointer)')
+
+local nums = { 42, 7, 99, -3, 15 }
+local buf = mem.alloc(#nums * 4)
+for i = 1, #nums do
+    mem.writei32(buf + (i - 1) * 4, nums[i])
+end
+
+local cmp = ffi.callback('i32 cmp(pointer, pointer)', function(a, b)
+    local va = mem.readi32(a)
+    local vb = mem.readi32(b)
+    if va < vb then return -1 end
+    if va > vb then return 1 end
+    return 0
+end)
+
+qsort(buf, #nums, 4, cmp.ptr)
+
+for i = 1, #nums do
+    print(mem.readi32(buf + (i - 1) * 4))
+end
+
+mem.free(buf)
+ffi.close(libc)
+```
+
+## Binding model
+
+Both bindings expose the same two top-level namespaces:
+
+- `ffi`
+- `memory`
+
+The naming is intentionally close across runtimes. Lua also provides camelCase aliases for the helpers that naturally use snake_case there.
+
+## `ffi`: native function interop
+
+### `ffi.flags`
+
+Dynamic loader flags exported by the runtime:
+
+- `LAZY`
+- `NOW`
+- `LOCAL`
+- `GLOBAL`
+- `NODELETE`
+- `NOLOAD`
+
+Use them with `ffi.open(path, flags)`.
+
+### `ffi.open(path[, flags])`
+
+Opens a shared library and returns a handle.
+
+Node example:
+
+```js
+const { ffi } = require('urb-ffi');
+const libc = ffi.open('libc.so.6', ffi.flags.NOW | ffi.flags.LOCAL);
+```
+
+### `ffi.close(handle)`
+
+Closes a library handle.
+
+### `ffi.sym(handle, name)`
+
+Looks up a symbol inside a loaded library and returns its address.
+
+### `ffi.sym_self(name)`
+
+Looks up a symbol in the current process without opening a library first.
+
+Lua example:
+
+```lua
+local urb = require('urb_ffi')
+local ffi = urb.ffi
+
+local puts = ffi.bind(ffi.sym_self('puts'), 'i32 puts(cstring)')
+local strlen = ffi.bind(ffi.sym_self('strlen'), 'u64 strlen(cstring)')
+
+puts('hello world from sym_self')
+print(strlen('hello world from sym_self'))
+```
+
+### `ffi.bind(ptr, signature)`
+
+Binds a native function pointer to a callable host object.
+
+- In Node, the return value is a JavaScript function.
+- In Lua, the return value is a callable object.
+
+Signature format:
+
+```text
+return_type function_name(arg0, arg1, arg2)
+```
+
+Examples:
+
+- `i32 puts(cstring)`
+- `cstring getenv(cstring)`
+- `void qsort(pointer, u64, u64, pointer)`
+- `i32 snprintf(pointer, u64, cstring, ...)`
+
+Supported FFI base types:
 
 - `void`
+- `bool`
 - `i8`, `u8`
 - `i16`, `u16`
-- `i32`, `u32`, `int`, `uint`
-- `i64`, `u64`, `long`, `ulong`
-- `f32`, `f64`, `float`, `double`
-- `bool`
-- `cstring`, `string`
-- `pointer`, `ptr`
+- `i32`, `u32`
+- `i64`, `u64`
+- `f32`, `f64`
+- `pointer`
+- `cstring`
 
-Extra rules:
+Accepted aliases in the high-level wrappers include:
 
-- `const` is accepted.
-- Any trailing `*` turns the type into `pointer`.
-- `pointer(tag)` is accepted; the tag is metadata only.
-- `...` must be the last argument.
-- Max argument count: `32`.
+- `boolean` → `bool`
+- `int8`, `uint8`, `byte`
+- `int16`, `uint16`
+- `int32`, `uint32`, `int`, `uint`
+- `int64`, `uint64`, `long`, `ulong`
+- `float32`, `float`, `float64`, `double`
+- `ptr` → `pointer`
+- `string` → `cstring`
 
-## 7. Practical rules for assemblers/emitters
+### Variadic functions
 
-- Emit only little-endian integers.
-- Keep all `reserved` bytes/words at `0`.
-- Use absolute PCs for branch aliases.
-- First executable PC is `const_count`, not `0`.
-- Use constants for strings, signatures, schemas, and literal numbers; code has no inline immediates.
-- For primitive arrays inside schemas, `view.get` returns the raw array address, not a view handle.
-- For `ffi.callv`, variadic type ids describe only the variadic tail.
+Variadic signatures use `...` as the last argument.
+
+Node example:
+
+```js
+const { ffi, memory: mem } = require('urb-ffi');
+
+const libc = ffi.open('libc.so.6');
+const snprintf = ffi.bind(
+  ffi.sym(libc, 'snprintf'),
+  'i32 snprintf(pointer, u64, cstring, ...)'
+);
+
+const buf = mem.alloc(64n);
+snprintf(buf, 64n, 'answer=%d pi=%.2f', 42, Math.PI);
+console.log(mem.readcstring(buf));
+
+mem.free(buf);
+ffi.close(libc);
+```
+
+For variadic arguments, the runtime infers a suitable native type from the host value:
+
+- booleans → `bool`
+- strings → `cstring`
+- integers → `i32`, `i64`, or `u64` depending on range/runtime
+- floating-point values → `f64`
+- null/pointer-like values → `pointer`
+
+### `ffi.callback(signature, fn)`
+
+Creates a real C-callable function pointer backed by a JavaScript or Lua function.
+
+The returned object contains at least:
+
+- `ptr`: the native function pointer to pass back into C
+
+It also owns internal resources, so **keep the callback object alive for as long as C may call it**.
+
+Node example:
+
+```js
+const { ffi, memory: mem } = require('urb-ffi');
+
+const libc = ffi.open('libc.so.6');
+const qsort = ffi.bind(ffi.sym(libc, 'qsort'), 'void qsort(pointer, u64, u64, pointer)');
+
+const buf = mem.alloc(5n * 4n);
+mem.writeArray(buf, 'i32', [42, 7, 99, -3, 15]);
+
+const cmp = ffi.callback('i32 cmp(pointer, pointer)', (a, b) => {
+  const va = mem.readi32(a);
+  const vb = mem.readi32(b);
+  return va < vb ? -1 : va > vb ? 1 : 0;
+});
+
+qsort(buf, 5n, 4n, cmp.ptr);
+console.log(mem.readArray(buf, 'i32', 5));
+
+mem.free(buf);
+ffi.close(libc);
+```
+
+### `ffi.errno()`
+
+Returns the current thread-local `errno` value after a native call.
+
+### `ffi.dlerror()`
+
+Returns the last dynamic-loader error string recorded by the runtime.
+
+## `memory`: raw memory and C layout tools
+
+The `memory` namespace covers raw allocation, typed reads and writes, string handling, arrays, and schema-driven views.
+
+### Allocation and lifetime
+
+Available in both bindings:
+
+- `memory.alloc(size)`
+- `memory.free(ptr)`
+- `memory.realloc(ptr, size)`
+- `memory.zero(ptr, size)`
+- `memory.copy(dst, src, size)`
+- `memory.set(ptr, byteValue, size)`
+- `memory.compare(a, b, size)`
+- `memory.nullptr()`
+- `memory.sizeof_ptr()` in Node and Lua
+
+Node example:
+
+```js
+const { memory: mem } = require('urb-ffi');
+
+let p = mem.alloc(8n);
+mem.writei32(p, 1);
+mem.writei32(p + 4n, 2);
+
+p = mem.realloc(p, 16n);
+mem.writei32(p + 8n, 3);
+mem.writei32(p + 12n, 4);
+
+console.log(mem.readi32(p), mem.readi32(p + 4n), mem.readi32(p + 8n), mem.readi32(p + 12n));
+mem.free(p);
+```
+
+### Typed primitive reads and writes
+
+Available in both bindings:
+
+- `readi8`, `readu8`
+- `readi16`, `readu16`
+- `readi32`, `readu32`
+- `readi64`, `readu64`
+- `readf32`, `readf64`
+- `writei8`, `writeu8`
+- `writei16`, `writeu16`
+- `writei32`, `writeu32`
+- `writei64`, `writeu64`
+- `writef32`, `writef64`
+- `readptr`, `writeptr`
+- `readcstring`, `writecstring`
+
+Lua example:
+
+```lua
+local mem = require('urb_ffi').memory
+
+local p = mem.alloc(8)
+mem.writei32(p, -7)
+mem.writef32(p + 4, 3.5)
+
+print(mem.readi32(p))
+print(mem.readf32(p + 4))
+
+mem.free(p)
+```
+
+### Convenience string allocation
+
+- Node: `memory.allocStr(text)`
+- Lua: `memory.alloc_str(text)` and `memory.allocStr(text)`
+
+Node example:
+
+```js
+const { memory: mem } = require('urb-ffi');
+const text = mem.allocStr('urb-ffi');
+console.log(mem.readcstring(text));
+mem.free(text);
+```
+
+### Primitive arrays
+
+- Node: `memory.readArray(ptr, type, count)` and `memory.writeArray(ptr, type, values)`
+- Lua: `memory.read_array`, `memory.write_array`, plus `readArray` and `writeArray` aliases
+
+Lua example:
+
+```lua
+local mem = require('urb_ffi').memory
+
+local p = mem.alloc(4 * 4)
+mem.write_array(p, 'i32', { 10, 20, 30, 40 })
+
+local values = mem.read_array(p, 'i32', 4)
+for i = 1, #values do
+    print(values[i])
+end
+
+mem.free(p)
+```
+
+## C layout schemas
+
+One of the most useful parts of `urb-ffi` is that structs and unions can be described directly in the host language.
+
+That unlocks:
+
+- `memory.struct_sizeof(schema)`
+- `memory.struct_offsetof(schema, fieldName)`
+- `memory.view(ptr, schema)`
+- `memory.viewArray(ptr, schema, count)` in Node
+- `memory.view_array(ptr, schema, count)` in Lua, plus `viewArray`
+
+### Node schema format
+
+Node uses plain objects. Field order is the object insertion order.
+
+```js
+const Point = {
+  x: 'i32',
+  y: 'i32',
+  value: 'f64',
+  flags: 'u64',
+};
+```
+
+Supported field forms in Node:
+
+- primitive: `x: 'i32'`
+- fixed array: `bytes: ['u8', 16]`
+- pointer field: `next: { __pointer: true }`
+- nested struct/union: `origin: OtherSchema`
+- top-level or nested union: add `__union: true`
+- explicit struct marker: `__struct: true`
+
+### Lua schema format
+
+Lua uses an ordered array form so field order is explicit.
+
+```lua
+local Point = {
+    { name = 'x', type = 'i32' },
+    { name = 'y', type = 'i32' },
+    { name = 'value', type = 'f64' },
+    { name = 'flags', type = 'u64' },
+}
+```
+
+Supported field forms in Lua:
+
+- primitive: `{ name = 'x', type = 'i32' }`
+- fixed array: `{ name = 'bytes', type = 'u8', count = 16 }`
+- pointer field: `{ name = 'next', pointer = true }`
+- nested struct/union: `{ name = 'origin', schema = OtherSchema }`
+- top-level or nested union: add `__union = true` on the schema table
+
+### `memory.struct_sizeof(schema)` and `memory.struct_offsetof(schema, field)`
+
+Lua example:
+
+```lua
+local mem = require('urb_ffi').memory
+
+local Point = {
+    { name = 'x', type = 'i32' },
+    { name = 'y', type = 'i32' },
+    { name = 'value', type = 'f64' },
+    { name = 'flags', type = 'u64' },
+}
+
+print(mem.struct_sizeof(Point))
+print(mem.struct_offsetof(Point, 'value'))
+```
+
+### `memory.view(ptr, schema)`
+
+Creates a live host-side view over native memory.
+
+- primitive fields are readable and writable
+- pointer fields are readable and writable
+- nested structs/unions are exposed as nested views
+- fixed arrays are readable as host arrays/tables
+- whole array fields and nested struct fields are **not** assigned as one value; edit their members instead
+
+Node example:
+
+```js
+const { memory: mem } = require('urb-ffi');
+
+const Vec3 = { x: 'f32', y: 'f32', z: 'f32' };
+const Ray = {
+  origin: Vec3,
+  direction: Vec3,
+};
+
+const rayPtr = mem.alloc(BigInt(mem.struct_sizeof(Ray)));
+mem.zero(rayPtr, BigInt(mem.struct_sizeof(Ray)));
+
+const ray = mem.view(rayPtr, Ray);
+ray.origin.x = 1;
+ray.origin.y = 2;
+ray.origin.z = 3;
+ray.direction.y = 1;
+
+console.log(ray.origin.x, ray.origin.y, ray.origin.z);
+console.log(ray.direction.x, ray.direction.y, ray.direction.z);
+
+mem.free(rayPtr);
+```
+
+### `memory.viewArray` / `memory.view_array`
+
+Creates an array-like view over a contiguous sequence of structs.
+
+Node example:
+
+```js
+const { memory: mem } = require('urb-ffi');
+
+const Point = { x: 'i32', y: 'i32' };
+const size = mem.struct_sizeof(Point);
+const ptr = mem.alloc(BigInt(size * 3));
+mem.zero(ptr, BigInt(size * 3));
+
+const points = mem.viewArray(ptr, Point, 3);
+points[0].x = 10;
+points[1].x = 20;
+points[2].x = 30;
+
+for (const point of points) {
+  console.log(point.x, point.y);
+}
+
+mem.free(ptr);
+```
+
+### Unions, pointer fields, and fixed arrays
+
+Node example showing all three:
+
+```js
+const { memory: mem } = require('urb-ffi');
+
+const FloatBits = {
+  data: {
+    __union: true,
+    f: 'f32',
+    u: 'u32',
+    b: ['u8', 4],
+  },
+};
+
+const NodeSchema = {
+  value: 'i32',
+  next: { __pointer: true },
+};
+
+const floatPtr = mem.alloc(4n);
+mem.writef32(floatPtr, 3.14);
+
+const unionView = mem.view(floatPtr, FloatBits);
+console.log(unionView.data.f);
+console.log(unionView.data.u);
+console.log(unionView.data.b);
+
+mem.free(floatPtr);
+```
+
+## API reference
+
+### Node.js surface
+
+```js
+const { ffi, memory } = require('urb-ffi');
+```
+
+#### `ffi`
+
+- `ffi.flags`
+- `ffi.open(path, flags?)`
+- `ffi.close(handle)`
+- `ffi.sym(handle, name)`
+- `ffi.sym_self(name)`
+- `ffi.bind(ptr, signature)`
+- `ffi.callback(signature, fn)`
+- `ffi.errno()`
+- `ffi.dlerror()`
+
+#### `memory`
+
+- `memory.alloc(size)`
+- `memory.free(ptr)`
+- `memory.realloc(ptr, size)`
+- `memory.zero(ptr, size)`
+- `memory.copy(dst, src, size)`
+- `memory.set(ptr, byteValue, size)`
+- `memory.compare(a, b, size)`
+- `memory.nullptr()`
+- `memory.sizeof_ptr()`
+- `memory.readptr(ptr)`
+- `memory.writeptr(ptr, value)`
+- `memory.readcstring(ptr)`
+- `memory.writecstring(ptr, text)`
+- `memory.readi8(ptr)` / `memory.writei8(ptr, value)`
+- `memory.readu8(ptr)` / `memory.writeu8(ptr, value)`
+- `memory.readi16(ptr)` / `memory.writei16(ptr, value)`
+- `memory.readu16(ptr)` / `memory.writeu16(ptr, value)`
+- `memory.readi32(ptr)` / `memory.writei32(ptr, value)`
+- `memory.readu32(ptr)` / `memory.writeu32(ptr, value)`
+- `memory.readi64(ptr)` / `memory.writei64(ptr, value)`
+- `memory.readu64(ptr)` / `memory.writeu64(ptr, value)`
+- `memory.readf32(ptr)` / `memory.writef32(ptr, value)`
+- `memory.readf64(ptr)` / `memory.writef64(ptr, value)`
+- `memory.allocStr(text)`
+- `memory.readArray(ptr, type, count)`
+- `memory.writeArray(ptr, type, values)`
+- `memory.struct_sizeof(schema)`
+- `memory.struct_offsetof(schema, fieldName)`
+- `memory.view(ptr, schema)`
+- `memory.viewArray(ptr, schema, count)`
+
+### Lua 5.4 surface
+
+```lua
+local urb = require('urb_ffi')
+local ffi, memory = urb.ffi, urb.memory
+```
+
+#### `ffi`
+
+- `ffi.flags`
+- `ffi.open(path, flags?)`
+- `ffi.close(handle)`
+- `ffi.sym(handle, name)`
+- `ffi.sym_self(name)`
+- `ffi.bind(ptr, signature)`
+- `ffi.callback(signature, fn)`
+- `ffi.errno()`
+- `ffi.dlerror()`
+
+#### `memory`
+
+- `memory.alloc(size)`
+- `memory.free(ptr)`
+- `memory.realloc(ptr, size)`
+- `memory.zero(ptr, size)`
+- `memory.copy(dst, src, size)`
+- `memory.set(ptr, byteValue, size)`
+- `memory.compare(a, b, size)`
+- `memory.nullptr()`
+- `memory.sizeof_ptr()`
+- `memory.readptr(ptr)`
+- `memory.writeptr(ptr, value)`
+- `memory.readcstring(ptr)`
+- `memory.writecstring(ptr, text)`
+- `memory.readi8(ptr)` / `memory.writei8(ptr, value)`
+- `memory.readu8(ptr)` / `memory.writeu8(ptr, value)`
+- `memory.readi16(ptr)` / `memory.writei16(ptr, value)`
+- `memory.readu16(ptr)` / `memory.writeu16(ptr, value)`
+- `memory.readi32(ptr)` / `memory.writei32(ptr, value)`
+- `memory.readu32(ptr)` / `memory.writeu32(ptr, value)`
+- `memory.readi64(ptr)` / `memory.writei64(ptr, value)`
+- `memory.readu64(ptr)` / `memory.writeu64(ptr, value)`
+- `memory.readf32(ptr)` / `memory.writef32(ptr, value)`
+- `memory.readf64(ptr)` / `memory.writef64(ptr, value)`
+- `memory.alloc_str(text)` and `memory.allocStr(text)`
+- `memory.read_array(ptr, type, count)` and `memory.readArray(ptr, type, count)`
+- `memory.write_array(ptr, type, values)` and `memory.writeArray(ptr, type, values)`
+- `memory.struct_sizeof(schema)`
+- `memory.struct_offsetof(schema, fieldName)`
+- `memory.view(ptr, schema)`
+- `memory.view_array(ptr, schema, count)` and `memory.viewArray(ptr, schema, count)`
+
+## Examples in the repository
+
+### Node examples
+
+- [bindings/node/examples/hello.js](bindings/node/examples/hello.js)
+- [bindings/node/examples/memory.js](bindings/node/examples/memory.js)
+- [bindings/node/examples/memory_utils.js](bindings/node/examples/memory_utils.js)
+- [bindings/node/examples/view.js](bindings/node/examples/view.js)
+- [bindings/node/examples/meta_fields.js](bindings/node/examples/meta_fields.js)
+- [bindings/node/examples/callback.js](bindings/node/examples/callback.js)
+- [bindings/node/examples/sym_self.js](bindings/node/examples/sym_self.js)
+- [bindings/node/examples/smoke.js](bindings/node/examples/smoke.js)
+
+### Lua examples
+
+- [bindings/lua/examples/hello.lua](bindings/lua/examples/hello.lua)
+- [bindings/lua/examples/memory.lua](bindings/lua/examples/memory.lua)
+- [bindings/lua/examples/view.lua](bindings/lua/examples/view.lua)
+- [bindings/lua/examples/callback.lua](bindings/lua/examples/callback.lua)
+- [bindings/lua/examples/sym_self.lua](bindings/lua/examples/sym_self.lua)
+
+## Notes and limitations
+
+- By-value recursive schemas are not supported.
+- Recursive data structures are still possible through pointer fields.
+- The Node binding is the npm-focused package surface.
+- The Lua binding currently loads a Unix-style shared object and is primarily documented for Unix-like environments.
+- If a symbol lookup or `dlopen` fails, check `ffi.dlerror()`.
+- If a native call reports failure through `errno`, inspect it with `ffi.errno()`.
+
+## In one sentence
+
+`urb-ffi` lets Node.js and Lua 5.4 load native libraries, call C functions, create callbacks, manage raw memory, and model real C layouts without leaving the host language.

@@ -1,7 +1,7 @@
 {
   "name": "urb-ffi",
   "author": "jardimdanificado",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "urb-ffi for nodejs",
   "main": "./bindings/node/index.js",
   "exports": {
@@ -9,7 +9,9 @@
   },
   "files": [
     "bindings/node/index.js",
+    "bindings/node/binding.gyp",
     "bindings/node/Makefile",
+    "bindings/node/scripts/**/*",
     "bindings/node/src/**/*",
     "include/**/*",
     "src/urbc_*.c",
@@ -18,9 +20,9 @@
     "bindings/node/README.md"
   ],
   "scripts": {
-    "build": "make -C bindings/node",
-    "test": "make -C bindings/node test",
-    "install": "npm run build",
+    "build": "node ./bindings/node/scripts/build.js",
+    "test": "node ./bindings/node/scripts/test.js",
+    "install": "node ./bindings/node/scripts/build.js",
     "prepack": "npm test"
   },
   "engines": {

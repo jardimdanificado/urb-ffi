@@ -1,6 +1,25 @@
 'use strict';
 
-const native = require('./dist/urb-ffi.node');
+const fs = require('fs');
+const path = require('path');
+
+function loadNative() {
+	const candidates = [
+		['dist/urb-ffi.node', 'dist build'],
+		['build/Release/urb_ffi.node', 'node-gyp release build'],
+		['build/Debug/urb_ffi.node', 'node-gyp debug build'],
+	];
+
+	for (const [relativePath] of candidates) {
+		const filePath = path.join(__dirname, relativePath);
+		if (!fs.existsSync(filePath)) continue;
+		return require(filePath);
+	}
+
+	throw new Error('Could not locate the urb-ffi native addon. Run `npm install` or `npm run build`.');
+}
+
+const native = loadNative();
 
 const PTR_SIZE = native.sizeofPtr();
 
