@@ -1,13 +1,23 @@
 #include <node_api.h>
 
 #include <math.h>
+#include <ffi.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define URBC_IMPLEMENTATION
-#include "../dist/urbc.h"
+#include "urbc.h"
+#include "urbc_internal.h"
+
+typedef struct UrbcBoundFn {
+    uint32_t magic;
+    void *fn_ptr;
+    ffi_cif cif;
+    ffi_type *ret_type;
+    ffi_type *arg_types[FSIG_MAX_ARGS];
+    FsigParsed sig;
+} UrbcBoundFn;
 
 typedef struct CallbackBinding CallbackBinding;
 typedef struct AddonState {

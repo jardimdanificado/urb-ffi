@@ -1,11 +1,7 @@
 NODE ?= node
 NODE_PREFIX ?=
 ROOT := $(abspath ../..)
-AMALGAMATE := $(ROOT)/tools/amalgamate.sh
 DIST_DIR := $(CURDIR)/dist
-AMALGAMATED_HEADER := $(DIST_DIR)/urbc.h
-AMALGAMATED_CLI := $(DIST_DIR)/urbccli.c
-AMALGAMATE_INPUTS := $(AMALGAMATE) $(ROOT)/include/urb.h $(ROOT)/src/urbc_internal.h $(wildcard $(ROOT)/include/urbc/*.h) $(wildcard $(ROOT)/src/*.c)
 NODE_BIN := $(shell command -v $(NODE) 2>/dev/null)
 NODE_INCLUDES ?= $(shell \
 	if [ -n "$(NODE_PREFIX)" ] && [ -f "$(NODE_PREFIX)/include/node/node_api.h" ]; then \
@@ -33,38 +29,43 @@ FFI_CFLAGS := $(shell $(PKG_CONFIG) --cflags libffi)
 FFI_LIBS := $(shell $(PKG_CONFIG) --libs libffi)
 
 CFLAGS ?= -O2 -Wall -Wextra -Wno-unused-parameter -std=c11 -fPIC -pthread
-CPPFLAGS ?= -DBUILDING_NODE_EXTENSION -I$(NODE_INCLUDES) $(FFI_CFLAGS)
+CPPFLAGS ?= -DBUILDING_NODE_EXTENSION -I$(NODE_INCLUDES) -I$(ROOT)/include -I$(ROOT)/src -I$(CURDIR)/src $(FFI_CFLAGS)
 LDFLAGS ?= -shared -fPIC -pthread
 LDLIBS ?= $(FFI_LIBS) -ldl -lm
 
-SRCS = src/urb_ffi_napi.c
-OBJS = $(patsubst src/%.c, $(DIST_DIR)/%.o, $(SRCS))
+LOCAL_SRCS = \
+	$(CURDIR)/src/urb_ffi_napi.c
+CORE_SRCS = \
+	$(ROOT)/src/urbc_format.c \
+	$(ROOT)/src/urbc_platform.c \
+	$(ROOT)/src/urbc_api.c \
+	$(ROOT)/src/urbc_ffi_sig.c \
+	$(ROOT)/src/urbc_loader.c \
+	$(ROOT)/src/urbc_schema.c \
+	$(ROOT)/src/urbc_runtime.c \
+	$(ROOT)/src/urbc_ops_core.c \
+	$(ROOT)/src/urbc_ops_mem.c \
+	$(ROOT)/src/urbc_ops_schema.c \
+	$(ROOT)/src/urbc_ops_ffi.c
+COMMON_DEPS = \
+	$(ROOT)/include/urbc.h \
+	$(ROOT)/include/urb.h \
+	$(wildcard $(ROOT)/include/urbc/*.h) \
+	$(ROOT)/src/urbc_internal.h
+OBJS = \
+	$(patsubst $(CURDIR)/src/%.c,$(DIST_DIR)/%.o,$(LOCAL_SRCS)) \
+	$(patsubst $(ROOT)/src/%.c,$(DIST_DIR)/core_%.o,$(CORE_SRCS))
 TARGET = $(DIST_DIR)/urb-ffi.node
 
-.PHONY: all clean test sync-dist ensure-dist
+.PHONY: all clean test
 
-all: ensure-dist $(TARGET)
+all: $(TARGET)
 
-sync-dist: | $(DIST_DIR)/
-	@if [ ! -x "$(AMALGAMATE)" ] || [ ! -f "$(ROOT)/include/urb.h" ]; then \
-		echo "sync-dist requires the urb-ffi repository root" >&2; \
-		exit 1; \
-	fi
-	$(AMALGAMATE)
-	cp "$(ROOT)/dist/urbc.h" "$(AMALGAMATED_HEADER)"
-	cp "$(ROOT)/dist/urbccli.c" "$(AMALGAMATED_CLI)"
+$(DIST_DIR)/%.o: $(CURDIR)/src/%.c $(COMMON_DEPS) | $(DIST_DIR)/
+	@echo "[CC] $<"
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-ensure-dist:
-	@if [ ! -f "$(AMALGAMATED_HEADER)" ] || [ ! -f "$(AMALGAMATED_CLI)" ]; then \
-		if [ -x "$(AMALGAMATE)" ] && [ -f "$(ROOT)/include/urb.h" ]; then \
-			$(MAKE) sync-dist; \
-		else \
-			echo "missing dist/urbc.h and dist/urbccli.c; publish must include them" >&2; \
-			exit 1; \
-		fi; \
-	fi
-
-$(DIST_DIR)/%.o: src/%.c $(AMALGAMATED_HEADER) | $(DIST_DIR)/
+$(DIST_DIR)/core_%.o: $(ROOT)/src/%.c $(COMMON_DEPS) | $(DIST_DIR)/
 	@echo "[CC] $<"
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 

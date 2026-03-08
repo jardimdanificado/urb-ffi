@@ -11,17 +11,17 @@
     "bindings/node/index.js",
     "bindings/node/Makefile",
     "bindings/node/src/**/*",
-    "bindings/node/dist/urbc.h",
-    "bindings/node/dist/urbccli.c",
+    "include/**/*",
+    "src/urbc_*.c",
+    "src/urbc_internal.h",
     "README.md",
     "bindings/node/README.md"
   ],
   "scripts": {
-    "sync-dist": "make -C bindings/node sync-dist",
     "build": "make -C bindings/node",
     "test": "make -C bindings/node test",
     "install": "npm run build",
-    "prepack": "npm run sync-dist"
+    "prepack": "npm test"
   },
   "engines": {
     "node": ">=12.17"

@@ -11,19 +11,11 @@ Publish from [bindings/node](bindings/node):
 
 ## Package layout
 
-The package is self-contained at publish time:
+The package is self-contained at publish time and builds from source:
 
 - [index.js](index.js): public JavaScript API
 - [src](src): native binding sources
-- [dist/urbc.h](dist/urbc.h): amalgamated C library header used to build the addon
-- [dist/urbccli.c](dist/urbccli.c): generated CLI source artifact shipped with the package
+- [../../include](../../include): public C headers shipped in the npm tarball
+- [../../src](../../src): C implementation sources shipped in the npm tarball
 
 The `.node` binary is built on install and is not published in the tarball.
-
-## Repository development
-
-Inside the repository, refresh the packaged amalgamated files with:
-
-- `npm run sync-dist`
-
-That command regenerates the root amalgamation and copies the needed files into [dist](dist).
