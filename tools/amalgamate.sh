@@ -3,6 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+DIST_DIR="$ROOT/dist"
 URB_HEADER="$ROOT/include/urb.h"
 PUBLIC_HEADERS=(
     "$ROOT/include/urbc/common.h"
@@ -225,10 +226,11 @@ emit_section() {
 }
 
 build_urbc_h() {
-    local output="$ROOT/urbc.h"
+    local output="$DIST_DIR/urbc.h"
     local tmp
     local file
 
+    mkdir -p "$DIST_DIR"
     tmp="$(mktemp)"
 
     {
@@ -261,9 +263,10 @@ build_urbc_h() {
 }
 
 build_urbccli_c() {
-    local output="$ROOT/urbccli.c"
+    local output="$DIST_DIR/urbccli.c"
     local tmp
 
+    mkdir -p "$DIST_DIR"
     tmp="$(mktemp)"
 
     {
@@ -279,7 +282,7 @@ build_urbccli_c() {
 main() {
     build_urbc_h
     build_urbccli_c
-    printf 'generated urbc.h and urbccli.c\n'
+    printf 'generated dist/urbc.h and dist/urbccli.c\n'
 }
 
 main "$@"
