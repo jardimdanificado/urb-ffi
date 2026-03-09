@@ -5,3 +5,4 @@
 /dist/*.so
 /bindings/node/dist/
 /bindings/node/build/
+/bindgen/build/

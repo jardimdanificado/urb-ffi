@@ -737,7 +737,7 @@ local ffi, memory = urb.ffi, urb.memory
 ## Notes and limitations
 
 - By-value recursive schemas are not supported.
-- Recursive data structures are still possible through pointer fields.
+- Recursive data structures can still be represented through pointer fields, but dereferencing is manual: store the address in a pointer field and create a new view from that address when traversing.
 - The Node binding is the npm-focused package surface.
 - The Lua binding currently loads a Unix-style shared object and is primarily documented for Unix-like environments.
 - If a symbol lookup or `dlopen` fails, check `ffi.dlerror()`.
