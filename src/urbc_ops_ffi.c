@@ -3,6 +3,12 @@
 #include <errno.h>
 #include <ffi.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
+
 typedef union UrbcArgBuf {
     int8_t i8; uint8_t u8;
     int16_t i16; uint16_t u16;
@@ -19,6 +25,7 @@ typedef struct UrbcBoundFn {
     ffi_type *ret_type;
     ffi_type *arg_types[FSIG_MAX_ARGS];
     FsigParsed sig;
+    const UrbcFfiDescriptor *desc; /* for by-value layout lookup */
 } UrbcBoundFn;
 
 typedef struct UrbcCallbackClosure {
@@ -29,7 +36,13 @@ typedef struct UrbcCallbackClosure {
     ffi_cif cif;
     ffi_type *arg_types[FSIG_MAX_ARGS];
     FsigParsed sig;
+    const UrbcFfiDescriptor *desc;
     UrbcHostBinding *binding;
+#ifdef _WIN32
+    DWORD owner_thread;
+#else
+    pthread_t owner_thread;
+#endif
 } UrbcCallbackClosure;
 
 typedef struct UrbcFfiDescriptorCacheEntry {
@@ -37,14 +50,32 @@ typedef struct UrbcFfiDescriptorCacheEntry {
     UrbcFfiDescriptor *descriptor;
 } UrbcFfiDescriptorCacheEntry;
 
+typedef struct UrbcFfiAttachedTypeEntry {
+    char *tag;
+    ffi_type *type;
+    int is_byvalue;
+    void *owner_ptr;
+} UrbcFfiAttachedTypeEntry;
+
 struct UrbcFfiDescriptor {
     uint32_t magic;
     FsigParsed sig;
+    List *attached_types; /* UrbcFfiAttachedTypeEntry* list */
 };
 
 #define URBC_FFI_DESC_MAGIC 0x55464453u
 
 static void urbc_callback_trampoline(ffi_cif *cif, void *ret, void **args, void *user);
+
+static int urbc_callback_on_owner_thread(const UrbcCallbackClosure *cb)
+{
+    if (!cb) return 0;
+#ifdef _WIN32
+    return cb->owner_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(cb->owner_thread, pthread_self());
+#endif
+}
 
 static int urbc_ffi_descriptor_valid(const UrbcFfiDescriptor *desc)
 {
@@ -188,6 +219,8 @@ static UrbcBoundFn *urbc_bound_from_value(Value v, const char *name)
     return (UrbcBoundFn *)v.p;
 }
 
+static UrbcFfiAttachedTypeEntry *urbc_ffi_descriptor_find_attached(const UrbcFfiDescriptor *desc, const char *tag);
+
 static UrbcBoundFn *urbc_bound_from_ptr(void *ptr, UrbcRuntime *rt, const char *name)
 {
     if (!ptr || *(uint32_t *)ptr != URBC_BOUND_MAGIC) {
@@ -197,8 +230,21 @@ static UrbcBoundFn *urbc_bound_from_ptr(void *ptr, UrbcRuntime *rt, const char *
     return (UrbcBoundFn *)ptr;
 }
 
-static void *urbc_value_to_arg(Value v, const FsigType *type, UrbcArgBuf *buf)
+static void *urbc_value_to_arg(Value v, const FsigType *type, const UrbcFfiDescriptor *desc, UrbcArgBuf *buf)
 {
+    /* handle by-value pointer/tag case first */
+    if (type->base == FSIG_POINTER && type->tag[0] && desc) {
+        UrbcFfiAttachedTypeEntry *e = urbc_ffi_descriptor_find_attached(desc, type->tag);
+        if (e && e->is_byvalue && e->type) {
+            /* allocate buffer of appropriate size and copy from provided pointer */
+            size_t sz = e->type->size;
+            void *src = (void *)(uintptr_t)v.u;
+            void *heap = urbc_runtime_alloc_owned(urbc_runtime_current(), sz);
+            if (!heap) return NULL;
+            if (src && sz > 0) memcpy(heap, src, sz);
+            return heap;
+        }
+    }
     switch (type->base) {
     case FSIG_BOOL: buf->u8 = (uint8_t)(v.i != 0); return buf;
     case FSIG_I8:   buf->i8 = (int8_t)v.i; return buf;
@@ -280,6 +326,18 @@ void urbc_ffi_descriptor_release(UrbcFfiDescriptor *desc)
 {
     if (!desc) return;
     desc->magic = 0;
+    if (desc->attached_types) {
+        while (desc->attached_types->size > 0) {
+            UrbcFfiAttachedTypeEntry *e = (UrbcFfiAttachedTypeEntry *)urb_pop(desc->attached_types).p;
+            if (e) {
+                free(e->tag);
+                if (e->owner_ptr) free(e->owner_ptr);
+                free(e);
+            }
+        }
+        urb_free(desc->attached_types);
+        desc->attached_types = NULL;
+    }
     free(desc);
 }
 
@@ -293,6 +351,80 @@ UrbcStatus urbc_ffi_descriptor_copy_parsed(const UrbcFfiDescriptor *desc,
     }
     *out_sig = desc->sig;
     return URBC_OK;
+}
+
+static UrbcFfiAttachedTypeEntry *urbc_ffi_descriptor_find_attached(const UrbcFfiDescriptor *desc, const char *tag)
+{
+    UHalf i;
+    UrbcFfiAttachedTypeEntry *e;
+    if (!desc || !tag || !desc->attached_types) return NULL;
+    for (i = 0; i < desc->attached_types->size; i++) {
+        e = (UrbcFfiAttachedTypeEntry *)desc->attached_types->data[i].p;
+        if (e && e->tag && strcmp(e->tag, tag) == 0) return e;
+    }
+    return NULL;
+}
+
+UrbcStatus urbc_ffi_descriptor_attach_ffi_type(UrbcFfiDescriptor *desc,
+                                               const char *tag,
+                                               ffi_type *type,
+                                               int is_byvalue,
+                                               void *owner_ptr,
+                                               char *err, size_t err_cap)
+{
+    UrbcFfiAttachedTypeEntry *entry;
+    if (!urbc_ffi_descriptor_valid(desc) || !tag || !type) {
+        urbc_copy_error(err, err_cap, "invalid attach arguments");
+        return URBC_ERR_ARGUMENT;
+    }
+    if (!desc->attached_types) {
+        desc->attached_types = urb_new(4);
+        if (!desc->attached_types) {
+            urbc_copy_error(err, err_cap, "out of memory");
+            return URBC_ERR_ALLOC;
+        }
+    }
+    if (urbc_ffi_descriptor_find_attached(desc, tag)) {
+        urbc_copy_error(err, err_cap, "duplicate attached tag");
+        return URBC_ERR_ARGUMENT;
+    }
+    entry = (UrbcFfiAttachedTypeEntry *)calloc(1, sizeof(*entry));
+    if (!entry) {
+        urbc_copy_error(err, err_cap, "out of memory");
+        return URBC_ERR_ALLOC;
+    }
+    entry->tag = (char *)malloc(strlen(tag) + 1);
+    if (!entry->tag) { free(entry); urbc_copy_error(err, err_cap, "out of memory"); return URBC_ERR_ALLOC; }
+    strcpy(entry->tag, tag);
+    entry->type = type;
+    entry->is_byvalue = is_byvalue ? 1 : 0;
+    entry->owner_ptr = owner_ptr;
+    urb_push(desc->attached_types, (Value){ .p = entry });
+    return URBC_OK;
+}
+
+static ffi_type *urbc_type_for_fsig(UrbcRuntime *rt, const FsigType *ft,
+                                   const UrbcFfiDescriptor *desc,
+                                   char *err, size_t err_cap)
+{
+    ffi_type *t = NULL;
+    if (!ft) return NULL;
+    if (ft->base == FSIG_POINTER) {
+        if (ft->tag[0] && desc) {
+            UrbcFfiAttachedTypeEntry *e = urbc_ffi_descriptor_find_attached(desc, ft->tag);
+            if (e) {
+                if (e->is_byvalue && e->type) return e->type;
+                return &ffi_type_pointer;
+            }
+        }
+        return &ffi_type_pointer;
+    }
+    t = urbc_fsig_ffi_type(ft->base);
+    if (!t) {
+        urbc_copy_error(err, err_cap, "unsupported FFI type");
+        return NULL;
+    }
+    return t;
 }
 
 UrbcStatus urbc_ffi_bind_handle_desc(UrbcRuntime *rt, void *fn_ptr,
@@ -320,15 +452,16 @@ UrbcStatus urbc_ffi_bind_handle_desc(UrbcRuntime *rt, void *fn_ptr,
     bf->sig = desc->sig;
     bf->magic = URBC_BOUND_MAGIC;
     bf->fn_ptr = fn_ptr;
-    bf->ret_type = urbc_fsig_ffi_type(bf->sig.ret.base);
+    bf->desc = desc;
+    bf->ret_type = urbc_type_for_fsig(rt, &bf->sig.ret, desc, rt->last_error, sizeof(rt->last_error));
     if (!bf->ret_type) {
-        urbc_runtime_fail(rt, "ffi.bind: unsupported return type");
+        urbc_runtime_fail(rt, "ffi.bind: %s", rt->last_error);
         goto fail;
     }
     for (i = 0; i < bf->sig.argc; i++) {
-        bf->arg_types[i] = urbc_fsig_ffi_type(bf->sig.args[i].base);
+        bf->arg_types[i] = urbc_type_for_fsig(rt, &bf->sig.args[i], desc, rt->last_error, sizeof(rt->last_error));
         if (!bf->arg_types[i]) {
-            urbc_runtime_fail(rt, "ffi.bind: unsupported arg type %d", i);
+            urbc_runtime_fail(rt, "ffi.bind: %s", rt->last_error);
             goto fail;
         }
     }
@@ -403,6 +536,7 @@ UrbcStatus urbc_ffi_call_bound(UrbcRuntime *rt, void *bound_handle, int argc,
     rt->last_error[0] = '\0';
     bf = urbc_bound_from_ptr(bound_handle, rt, "ffi.call");
     if (!bf) goto fail;
+    const UrbcFfiDescriptor *desc = bf->desc; /* may be NULL for old handles */
     extra = argc - bf->sig.argc;
     if (!bf->sig.has_varargs && argc != bf->sig.argc) {
         urbc_runtime_fail(rt, "ffi.call: expected %d args, got %d", bf->sig.argc, argc);
@@ -417,8 +551,24 @@ UrbcStatus urbc_ffi_call_bound(UrbcRuntime *rt, void *bound_handle, int argc,
         goto fail;
     }
 
+    /* prepare return storage; pointer(tag)+attached-byvalue uses owned struct buffer */
+    void *ret_storage = &retbuf;
+    void *owned_ret = NULL;
+    UrbcFfiAttachedTypeEntry *ret_byvalue = NULL;
+    if (desc && bf->sig.ret.base == FSIG_POINTER && bf->sig.ret.tag[0]) {
+        ret_byvalue = urbc_ffi_descriptor_find_attached(desc, bf->sig.ret.tag);
+        if (ret_byvalue && ret_byvalue->is_byvalue && ret_byvalue->type) {
+            owned_ret = urbc_runtime_alloc_owned(rt, ret_byvalue->type->size);
+            if (!owned_ret) {
+                urbc_runtime_fail(rt, "ffi.call: out of memory for return buffer");
+                goto fail;
+            }
+            ret_storage = owned_ret;
+        }
+    }
+
     for (i = 0; i < bf->sig.argc; i++) {
-        argptrs[i] = urbc_value_to_arg(argv[i], &bf->sig.args[i], &argbufs[i]);
+        argptrs[i] = urbc_value_to_arg(argv[i], &bf->sig.args[i], desc, &argbufs[i]);
         if (!argptrs[i]) {
             urbc_runtime_fail(rt, "ffi.call: incompatible fixed argument %d", i);
             goto fail;
@@ -448,8 +598,18 @@ UrbcStatus urbc_ffi_call_bound(UrbcRuntime *rt, void *bound_handle, int argc,
     }
 
     memset(&retbuf, 0, sizeof(retbuf));
-    ffi_call(cif, FFI_FN(bf->fn_ptr), &retbuf, argptrs);
-    if (out) *out = urbc_value_from_ret(bf->sig.ret.base, &retbuf);
+    ffi_call(cif, FFI_FN(bf->fn_ptr), ret_storage, argptrs);
+    if (out) {
+        uint8_t prim;
+        if (ret_byvalue && owned_ret) {
+            memset(out, 0, sizeof(*out));
+            out->u = (UInt)(uintptr_t)owned_ret;
+        } else if (urbc_fsig_to_prim(bf->sig.ret.base, &prim)) {
+            *out = urbc_value_from_ret(bf->sig.ret.base, ret_storage);
+        } else {
+            memset(out, 0, sizeof(*out));
+        }
+    }
     urbc_runtime_set_current(prev);
     urbc_runtime_unlock(rt);
     return URBC_OK;
@@ -488,22 +648,23 @@ UrbcStatus urbc_ffi_make_callback_desc(UrbcRuntime *rt,
         goto fail;
     }
     cb->sig = desc->sig;
+    cb->desc = desc;
     if (cb->sig.has_varargs) {
         free(cb);
         urbc_runtime_fail(rt, "ffi.callback: variadic callbacks are not supported");
         goto fail;
     }
-    ret_type = urbc_fsig_ffi_type(cb->sig.ret.base);
+    ret_type = urbc_type_for_fsig(rt, &cb->sig.ret, desc, rt->last_error, sizeof(rt->last_error));
     if (!ret_type) {
         free(cb);
-        urbc_runtime_fail(rt, "ffi.callback: unsupported return type");
+        urbc_runtime_fail(rt, "ffi.callback: %s", rt->last_error);
         goto fail;
     }
     for (i = 0; i < cb->sig.argc; i++) {
-        cb->arg_types[i] = urbc_fsig_ffi_type(cb->sig.args[i].base);
+        cb->arg_types[i] = urbc_type_for_fsig(rt, &cb->sig.args[i], desc, rt->last_error, sizeof(rt->last_error));
         if (!cb->arg_types[i]) {
             free(cb);
-            urbc_runtime_fail(rt, "ffi.callback: unsupported arg type %d", i);
+            urbc_runtime_fail(rt, "ffi.callback: %s", rt->last_error);
             goto fail;
         }
     }
@@ -522,6 +683,11 @@ UrbcStatus urbc_ffi_make_callback_desc(UrbcRuntime *rt,
     cb->magic = URBC_CALLBACK_MAGIC;
     cb->rt = rt;
     cb->binding = binding;
+#ifdef _WIN32
+    cb->owner_thread = GetCurrentThreadId();
+#else
+    cb->owner_thread = pthread_self();
+#endif
     if (ffi_prep_closure_loc(cb->closure, &cb->cif, urbc_callback_trampoline, cb, cb->fn_ptr) != FFI_OK) {
         ffi_closure_free(cb->closure);
         free(cb);
@@ -598,14 +764,28 @@ static void urbc_callback_trampoline(ffi_cif *cif, void *ret, void **args, void 
     UrbcRuntime *prev;
     uint8_t prim;
     int i;
-    (void)cif;
     if (!cb || !cb->binding || !cb->rt) return;
+    if (!urbc_callback_on_owner_thread(cb)) {
+        if (ret && cif && cif->rtype && cif->rtype->size > 0) {
+            memset(ret, 0, cif->rtype->size);
+        }
+        return;
+    }
     urbc_runtime_lock(cb->rt);
     prev = urbc_runtime_current();
     urbc_runtime_set_current(cb->rt);
     cb->rt->failed = 0;
     cb->rt->last_error[0] = '\0';
     for (i = 0; i < cb->sig.argc; i++) {
+        if (cb->desc && cb->sig.args[i].base == FSIG_POINTER && cb->sig.args[i].tag[0]) {
+            UrbcFfiAttachedTypeEntry *attached =
+                urbc_ffi_descriptor_find_attached(cb->desc, cb->sig.args[i].tag);
+            if (attached && attached->is_byvalue && attached->type) {
+                memset(&argv[i], 0, sizeof(argv[i]));
+                argv[i].u = (UInt)(uintptr_t)args[i];
+                continue;
+            }
+        }
         if (!urbc_fsig_to_prim(cb->sig.args[i].base, &prim)) {
             cb->rt->failed = 1;
             snprintf(cb->rt->last_error, sizeof(cb->rt->last_error), "ffi.callback: unsupported callback arg type %d", i);
@@ -617,6 +797,18 @@ static void urbc_callback_trampoline(ffi_cif *cif, void *ret, void **args, void 
     }
     out = urbc_host_invoke(cb->rt, cb->binding, cb->sig.argc, argv);
     if (cb->sig.ret.base != FSIG_VOID && ret && !cb->rt->failed) {
+        if (cb->desc && cb->sig.ret.base == FSIG_POINTER && cb->sig.ret.tag[0]) {
+            UrbcFfiAttachedTypeEntry *attached =
+                urbc_ffi_descriptor_find_attached(cb->desc, cb->sig.ret.tag);
+            if (attached && attached->is_byvalue && attached->type) {
+                void *src = (void *)(uintptr_t)out.u;
+                if (!src) memset(ret, 0, attached->type->size);
+                else memcpy(ret, src, attached->type->size);
+            } else if (!urbc_fsig_to_prim(cb->sig.ret.base, &prim) || !urbc_value_to_memory(prim, out, ret)) {
+                cb->rt->failed = 1;
+                snprintf(cb->rt->last_error, sizeof(cb->rt->last_error), "ffi.callback: unsupported callback return type");
+            }
+        } else
         if (!urbc_fsig_to_prim(cb->sig.ret.base, &prim) || !urbc_value_to_memory(prim, out, ret)) {
             cb->rt->failed = 1;
             snprintf(cb->rt->last_error, sizeof(cb->rt->last_error), "ffi.callback: unsupported callback return type");

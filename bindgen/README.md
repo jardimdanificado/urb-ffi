@@ -25,6 +25,7 @@ It maps declarations into the current `urb-ffi` feature set.
 
 - primitive integer and floating-point types supported by `urb-ffi`
 - pointers and `char *`/`const char *`
+- function-pointer parameters and returns in generated rich descriptors
 - fixed primitive arrays in record fields
 - nested structs/unions by value
 - record and enum typedef aliases
@@ -36,10 +37,10 @@ It maps declarations into the current `urb-ffi` feature set.
 - no bit-field schema generation
 - no anonymous field flattening
 - no VLA / incomplete array schema generation
-- direct `urb-ffi` FFI signatures still do not encode by-value record arguments or returns
-- Node/Lua wrappers only auto-recover by-value record calls when the records are schema-compatible and the function is not variadic
+- raw string `urb-ffi` FFI signatures still do not encode by-value record arguments or returns
+- generated Node/Lua wrappers now bind schema-compatible non-variadic by-value record calls directly through rich `ffi.type.*` descriptors
 - no `long double` / 128-bit float lowering
-- function pointers are treated as generic pointers in generated signatures
+- plain generated record schemas still expose function-pointer fields as generic pointers
 
 ## Build
 
@@ -101,14 +102,16 @@ bindgen/build/urb-bindgen \
   --output stdio.js
 ```
 
-When the header contains functions that pass structs/unions by value, the Node emitter also writes a sidecar C shim next to the wrapper, for example:
+If a generated Node wrapper ever needs a sidecar C shim, it is written next to the wrapper, for example:
 
 - `stdio.shim.c`
 - `stdio.shim.so` (or platform equivalent)
 
-By default, `urb-bindgen` now also compiles that shim shared library automatically.
+For schema-compatible non-variadic by-value records, current generated wrappers bind those functions directly and no shim sidecar is needed.
 
-If you only want the C source and do not want the automatic compile step, pass:
+If a future wrapper path still needs a shim, `urb-bindgen` can also compile that shim shared library automatically.
+
+If a shim is emitted and you only want the C source without the automatic compile step, pass:
 
 ```bash
 bindgen/build/urb-bindgen \
@@ -129,7 +132,7 @@ bindgen/build/urb-bindgen \
   --output stdio.lua
 ```
 
-Like the Node emitter, the Lua emitter also writes and auto-builds a `.shim.c` sidecar when by-value record adapters are needed.
+Like the Node emitter, the Lua emitter binds schema-compatible non-variadic by-value record calls directly and only falls back to a sidecar shim if a generated wrapper path explicitly needs one.
 
 ### Extra include paths / defines
 
@@ -168,6 +171,7 @@ The JSON output is the canonical IR-like export for now. It includes:
 - records with schema support status
 - enums
 - functions with generated `urb-ffi` signatures when possible
+- richer type metadata including function-pointer pointee information
 - wrapper support status (`direct`, `shim`, or unsupported)
 
 ### Node
@@ -180,7 +184,7 @@ The Node emitter generates a wrapper that exports:
 - `signatures`
 - `unsupportedFunctions`
 
-`load()` binds direct functions against the selected library through `urb-ffi` and uses the generated shim library for by-value record functions when needed.
+`load()` binds callable functions against the selected library through `urb-ffi`. Schema-compatible non-variadic by-value record functions use rich `ffi.type.*` descriptors directly, without a shim sidecar.
 
 ### Lua
 
@@ -192,14 +196,14 @@ The Lua emitter generates a wrapper that exports:
 - `signatures`
 - `unsupported_functions`
 
-`load()` follows the same model as the Node wrapper: direct calls use the target library, while by-value record calls go through the generated shim library.
+`load()` follows the same model as the Node wrapper: direct calls use the target library, and schema-compatible non-variadic by-value record calls bind directly through rich descriptors.
 
 ## Intended next steps
 
 Useful next iterations are:
 
 1. macro constant extraction
-2. function-pointer metadata for callbacks
-3. header allow/deny filters
-4. richer typedef export
-5. direct JSON-to-wrapper secondary emitters
+2. header allow/deny filters
+3. richer typedef export
+4. direct JSON-to-wrapper secondary emitters
+5. richer generated record schemas for function-pointer fields

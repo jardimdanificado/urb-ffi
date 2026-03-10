@@ -3,6 +3,7 @@ NODE_PREFIX ?=
 ROOT := $(abspath ../..)
 DIST_DIR := $(CURDIR)/dist
 NODE_BIN := $(shell command -v $(NODE) 2>/dev/null)
+SUF := $(shell echo "$(shell uname)" | grep -qi darwin && echo .dylib || echo .so)
 NODE_INCLUDES ?= $(shell \
 	if [ -n "$(NODE_PREFIX)" ] && [ -f "$(NODE_PREFIX)/include/node/node_api.h" ]; then \
 		printf "%s" "$(NODE_PREFIX)/include/node"; \
@@ -76,15 +77,21 @@ $(TARGET): $(OBJS)
 $(DIST_DIR)/:
 	mkdir -p $(DIST_DIR)
 
-clean:
-	rm -rf $(DIST_DIR)
+examples/libbyvalue$(SUF): $(CURDIR)/examples/byvalue.c
+	@echo "[CC] building byvalue library"
+	$(CC) -shared -fPIC -pthread -o $@ $<
 
-test: all
+clean:
+	rm -rf $(DIST_DIR) $(CURDIR)/examples/libbyvalue*
+
+test: all examples/libbyvalue$(SUF)
 	@echo "=== hello ===" && $(NODE) examples/hello.js
 	@echo "=== manual_types ===" && $(NODE) examples/manual_types.js
 	@echo "=== memory ===" && $(NODE) examples/memory.js
 	@echo "=== view ===" && $(NODE) examples/view.js
+	@echo "=== memory_phase6 ===" && $(NODE) examples/memory_phase6.js
 	@echo "=== callback ===" && $(NODE) examples/callback.js
 	@echo "=== meta_fields ===" && $(NODE) examples/meta_fields.js
 	@echo "=== memory_utils ===" && $(NODE) examples/memory_utils.js
 	@echo "=== sym_self ===" && $(NODE) examples/sym_self.js
+	@echo "=== byvalue ===" && $(NODE) examples/byvalue.js

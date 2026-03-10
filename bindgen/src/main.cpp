@@ -58,6 +58,7 @@ struct TypeInfo {
     enum class Kind {
         Primitive,
         Pointer,
+        Function,
         CString,
         Array,
         Record,
@@ -70,6 +71,10 @@ struct TypeInfo {
     std::string reason;
     std::uint64_t arrayCount = 0;
     std::shared_ptr<TypeInfo> element;
+    std::shared_ptr<TypeInfo> pointee;
+    std::shared_ptr<TypeInfo> functionResult;
+    std::vector<std::shared_ptr<TypeInfo>> functionArgs;
+    bool functionVariadic = false;
     std::shared_ptr<RecordInfo> record;
     std::shared_ptr<EnumInfo> enumInfo;
 };
@@ -374,7 +379,9 @@ std::string sanitizeIdentifier(const std::string &value)
 struct CallableFunctionInfo {
     FunctionInfo fn;
     bool direct = false;
+    bool richDirect = false;
     bool shimmed = false;
+    bool returnsByValueRecord = false;
     bool returnsViaOutPointer = false;
     std::vector<bool> paramByValueRecord;
     std::string publicSignature;
@@ -790,6 +797,11 @@ private:
             }
             info.kind = TypeInfo::Kind::Pointer;
             info.urbName = "pointer";
+            TypeInfo pointeeInfo = buildTypeInfo(canonicalPointee, TypeUse::General);
+            if (pointeeInfo.kind != TypeInfo::Kind::Unsupported
+                && !(pointeeInfo.kind == TypeInfo::Kind::Primitive && pointeeInfo.urbName == "void")) {
+                info.pointee = std::make_shared<TypeInfo>(std::move(pointeeInfo));
+            }
             return info;
         }
         case CXType_ConstantArray: {
@@ -840,10 +852,19 @@ private:
             return info;
         }
         case CXType_FunctionProto:
-        case CXType_FunctionNoProto:
-            info.kind = TypeInfo::Kind::Unsupported;
-            info.reason = "function types must appear behind a pointer";
+        case CXType_FunctionNoProto: {
+            info.kind = TypeInfo::Kind::Function;
+            info.functionResult = std::make_shared<TypeInfo>(buildTypeInfo(clang_getResultType(type), TypeUse::FunctionReturn));
+            info.functionVariadic = type.kind == CXType_FunctionProto && clang_isFunctionTypeVariadic(type) != 0;
+            const int argc = clang_getNumArgTypes(type);
+            if (argc > 0) {
+                info.functionArgs.reserve(static_cast<std::size_t>(argc));
+                for (int i = 0; i < argc; ++i) {
+                    info.functionArgs.push_back(std::make_shared<TypeInfo>(buildTypeInfo(clang_getArgType(type, i), TypeUse::FunctionParam)));
+                }
+            }
             return info;
+        }
         case CXType_LongDouble:
         case CXType_Float128:
             info.kind = TypeInfo::Kind::Unsupported;
@@ -1012,6 +1033,10 @@ private:
                 path.pop_back();
                 return { false, "anonymous fields are not supported by the current schema model" };
             }
+            if (field.name.rfind("__", 0) == 0) {
+                path.pop_back();
+                return { false, "field names beginning with __ are reserved by the current schema model" };
+            }
             if (field.isBitField) {
                 path.pop_back();
                 return { false, "bit-fields are not supported by the current schema model" };
@@ -1114,6 +1139,21 @@ private:
     {
         const std::string spelling = trim(type.cSpelling);
         if (!spelling.empty()) return spelling;
+        if (type.kind == TypeInfo::Kind::Pointer) {
+            if (type.pointee) {
+                return "pointer(" + displayTypeName(*type.pointee) + ")";
+            }
+            return type.urbName.empty() ? std::string("pointer") : type.urbName;
+        }
+        if (type.kind == TypeInfo::Kind::Function) {
+            std::vector<std::string> args;
+            for (const auto &arg : type.functionArgs) {
+                args.push_back(arg ? displayTypeName(*arg) : std::string("pointer"));
+            }
+            if (type.functionVariadic) args.push_back("...");
+            return "function(" + (type.functionResult ? displayTypeName(*type.functionResult) : std::string("void"))
+                + " (" + join(args, ", ") + "))";
+        }
         if (type.kind == TypeInfo::Kind::Record && type.record) {
             const auto names = namesForRecord(type.record);
             if (!names.empty()) return names.front();
@@ -1157,6 +1197,34 @@ private:
         return checkByValueRecord(type).ok;
     }
 
+    bool directDescriptorCompatibleType(const TypeInfo &type) const
+    {
+        switch (type.kind) {
+        case TypeInfo::Kind::Primitive:
+        case TypeInfo::Kind::CString:
+        case TypeInfo::Kind::Enum:
+            return true;
+        case TypeInfo::Kind::Pointer:
+            if (type.pointee && type.pointee->kind == TypeInfo::Kind::Function) {
+                return directDescriptorCompatibleType(*type.pointee);
+            }
+            return true;
+        case TypeInfo::Kind::Array:
+            return type.element && (type.element->kind == TypeInfo::Kind::Primitive || type.element->kind == TypeInfo::Kind::Enum);
+        case TypeInfo::Kind::Record:
+            return checkByValueRecord(type).ok;
+        case TypeInfo::Kind::Function:
+            if (!type.functionResult || !directDescriptorCompatibleType(*type.functionResult)) return false;
+            for (const auto &arg : type.functionArgs) {
+                if (!arg || !directDescriptorCompatibleType(*arg)) return false;
+            }
+            return true;
+        case TypeInfo::Kind::Unsupported:
+        default:
+            return false;
+        }
+    }
+
     std::string recordSchemaName(const TypeInfo &type) const
     {
         const std::string spelling = trim(type.cSpelling);
@@ -1169,6 +1237,12 @@ private:
             if (!type.record->name.empty()) return type.record->name;
         }
         return spelling;
+    }
+
+    std::string wrapperRecordKey(const TypeInfo &type) const
+    {
+        if (type.kind != TypeInfo::Kind::Record || !type.record) return {};
+        return preferredRecordName(type.record);
     }
 
     std::string shimSymbolFor(const FunctionInfo &fn) const
@@ -1209,27 +1283,22 @@ private:
         }
 
         if (fn.variadic) return std::nullopt;
-        if (!shimCompatibleType(fn.result)) return std::nullopt;
+        if (!directDescriptorCompatibleType(fn.result)) return std::nullopt;
 
-        info.shimmed = true;
-        info.returnsViaOutPointer = (fn.result.kind == TypeInfo::Kind::Record);
-        info.bindSymbol = shimSymbolFor(fn);
-
-        std::vector<std::string> argSigs;
-        if (info.returnsViaOutPointer) argSigs.push_back("pointer");
-
-        for (const ParamInfo &param : fn.params) {
-            if (!shimCompatibleType(param.type)) return std::nullopt;
-            const bool byValueRecord = (param.type.kind == TypeInfo::Kind::Record);
-            info.paramByValueRecord.push_back(byValueRecord);
-            if (byValueRecord) argSigs.push_back("pointer");
-            else argSigs.push_back(*directSigAtom(param.type));
+        info.direct = true;
+        info.richDirect = true;
+        info.bindSymbol = fn.name;
+        info.returnsByValueRecord = (fn.result.kind == TypeInfo::Kind::Record);
+        if (info.returnsByValueRecord && wrapperRecordKey(fn.result).empty()) {
+            return std::nullopt;
         }
 
-        const std::string retSig = info.returnsViaOutPointer ? "void" : *directSigAtom(fn.result);
-        std::ostringstream sig;
-        sig << retSig << ' ' << info.bindSymbol << '(' << join(argSigs, ", ") << ')';
-        info.bindSignature = sig.str();
+        for (const ParamInfo &param : fn.params) {
+            if (!directDescriptorCompatibleType(param.type)) return std::nullopt;
+            const bool byValueRecord = (param.type.kind == TypeInfo::Kind::Record);
+            if (byValueRecord && wrapperRecordKey(param.type).empty()) return std::nullopt;
+            info.paramByValueRecord.push_back(byValueRecord);
+        }
         return info;
     }
 
@@ -1256,6 +1325,16 @@ private:
     {
         return std::any_of(functions.begin(), functions.end(), [](const CallableFunctionInfo &fn) {
             return fn.shimmed;
+        });
+    }
+
+    bool needsRecordHelpers(const std::vector<CallableFunctionInfo> &functions) const
+    {
+        return std::any_of(functions.begin(), functions.end(), [](const CallableFunctionInfo &fn) {
+            return fn.returnsByValueRecord
+                || std::any_of(fn.paramByValueRecord.begin(), fn.paramByValueRecord.end(), [](bool byValue) {
+                    return byValue;
+                });
         });
     }
 
@@ -1607,7 +1686,22 @@ private:
         case TypeInfo::Kind::CString:
             out << "{ \"kind\": " << quoteJson(kindName(type.kind))
                 << ", \"urb\": " << quoteJson(type.urbName)
-                << ", \"c\": " << quoteJson(type.cSpelling) << " }";
+                << ", \"c\": " << quoteJson(type.cSpelling);
+            if (type.pointee) {
+                out << ", \"pointee\": " << emitJsonTypeSummary(*type.pointee);
+            }
+            out << " }";
+            break;
+        case TypeInfo::Kind::Function:
+            out << "{ \"kind\": \"function\", \"c\": " << quoteJson(type.cSpelling)
+                << ", \"variadic\": " << (type.functionVariadic ? "true" : "false")
+                << ", \"return\": " << (type.functionResult ? emitJsonTypeSummary(*type.functionResult) : std::string("null"))
+                << ", \"args\": [";
+            for (std::size_t i = 0; i < type.functionArgs.size(); ++i) {
+                if (i) out << ", ";
+                out << (type.functionArgs[i] ? emitJsonTypeSummary(*type.functionArgs[i]) : std::string("null"));
+            }
+            out << "] }";
             break;
         case TypeInfo::Kind::Enum:
             out << "{ \"kind\": \"enum\", \"urb\": " << quoteJson(type.urbName)
@@ -1639,6 +1733,7 @@ private:
         switch (kind) {
         case TypeInfo::Kind::Primitive: return "primitive";
         case TypeInfo::Kind::Pointer: return "pointer";
+        case TypeInfo::Kind::Function: return "function";
         case TypeInfo::Kind::CString: return "cstring";
         case TypeInfo::Kind::Array: return "array";
         case TypeInfo::Kind::Record: return "record";
@@ -1648,6 +1743,204 @@ private:
         return "unknown";
     }
 
+    std::string preferredRecordName(const std::shared_ptr<RecordInfo> &record) const
+    {
+        if (!record) return {};
+        const auto names = namesForRecord(record);
+        if (!names.empty()) return names.front();
+        if (!record->name.empty()) return record->name;
+        return {};
+    }
+
+    std::string preferredEnumName(const std::shared_ptr<EnumInfo> &info) const
+    {
+        if (!info) return {};
+        const auto names = namesForEnum(info);
+        if (!names.empty()) return names.front();
+        if (!info->name.empty()) return info->name;
+        return {};
+    }
+
+    std::string preferredRecordName(const RecordInfo &record) const
+    {
+        auto it = recordsByKey_.find(record.key);
+        if (it != recordsByKey_.end()) {
+            return preferredRecordName(it->second);
+        }
+        if (!record.name.empty()) return record.name;
+        return {};
+    }
+
+    std::string emitNodeAbiField(const FieldInfo &field, int level, std::vector<std::string> path) const
+    {
+        std::ostringstream out;
+        out << "{ name: " << quoteJs(field.name)
+            << ", type: " << emitNodeAbiType(field.type, level, std::move(path)) << " }";
+        return out.str();
+    }
+
+    std::string emitNodeAbiRecordType(const RecordInfo &record, int level, std::vector<std::string> path) const
+    {
+        std::ostringstream out;
+        const std::string ctor = record.kind == "union" ? "ffi.type.union" : "ffi.type.struct";
+        out << ctor << "([";
+        path.push_back(record.key);
+        if (!record.fields.empty()) out << "\n";
+        for (std::size_t i = 0; i < record.fields.size(); ++i) {
+            out << indent(level + 1) << emitNodeAbiField(record.fields[i], level + 1, path);
+            out << (i + 1 < record.fields.size() ? ",\n" : "\n");
+        }
+        out << indent(level) << "]";
+        const std::string name = preferredRecordName(record);
+        if (!name.empty()) {
+            out << ", { name: " << quoteJs(name) << " }";
+        }
+        out << ")";
+        return out.str();
+    }
+
+    std::string emitNodeAbiType(const TypeInfo &type, int level, std::vector<std::string> path) const
+    {
+        switch (type.kind) {
+        case TypeInfo::Kind::Primitive:
+            if (type.urbName == "void") return "ffi.type.void()";
+            return "ffi.type." + sanitizeIdentifier(type.urbName) + "()";
+        case TypeInfo::Kind::CString:
+            return "ffi.type.cstring()";
+        case TypeInfo::Kind::Pointer:
+            if (!type.pointee) return "ffi.type.pointer()";
+            return "ffi.type.pointer(" + emitNodeAbiType(*type.pointee, level, std::move(path)) + ")";
+        case TypeInfo::Kind::Function: {
+            if (!type.functionResult) return "null";
+            std::ostringstream out;
+            out << "ffi.type.func(" << emitNodeAbiType(*type.functionResult, level, {}) << ", [";
+            if (!type.functionArgs.empty()) out << "\n";
+            for (std::size_t i = 0; i < type.functionArgs.size(); ++i) {
+                out << indent(level + 1) << (type.functionArgs[i] ? emitNodeAbiType(*type.functionArgs[i], level + 1, {}) : std::string("ffi.type.pointer()"));
+                out << (i + 1 < type.functionArgs.size() ? ",\n" : "\n");
+            }
+            out << indent(level) << "]";
+            if (type.functionVariadic) out << ", { varargs: true }";
+            out << ")";
+            return out.str();
+        }
+        case TypeInfo::Kind::Enum: {
+            const std::string enumName = preferredEnumName(type.enumInfo);
+            if (enumName.empty()) return "ffi.type." + sanitizeIdentifier(type.urbName) + "()";
+            return "ffi.type.enum(ENUMS[" + quoteJs(enumName) + "], { underlying: ffi.type." + sanitizeIdentifier(type.urbName) + "() })";
+        }
+        case TypeInfo::Kind::Array:
+            if (!type.element) return "null";
+            return "ffi.type.array(" + emitNodeAbiType(*type.element, level, std::move(path)) + ", " + std::to_string(type.arrayCount) + ")";
+        case TypeInfo::Kind::Record:
+            if (!type.record) return "null";
+            return emitNodeAbiRecordType(*type.record, level, std::move(path));
+        case TypeInfo::Kind::Unsupported:
+            return "null";
+        }
+        return "null";
+    }
+
+    std::string emitNodeFunctionDescriptor(const FunctionInfo &fn, int level) const
+    {
+        std::ostringstream out;
+        out << "ffi.type.func(" << emitNodeAbiType(fn.result, level, {}) << ", [";
+        if (!fn.params.empty()) out << "\n";
+        for (std::size_t i = 0; i < fn.params.size(); ++i) {
+            out << indent(level + 1) << emitNodeAbiType(fn.params[i].type, level + 1, {});
+            out << (i + 1 < fn.params.size() ? ",\n" : "\n");
+        }
+        out << indent(level) << "], { name: " << quoteJs(fn.name);
+        if (fn.variadic) out << ", varargs: true";
+        out << " })";
+        return out.str();
+    }
+
+    std::string emitLuaAbiField(const FieldInfo &field, int level, std::vector<std::string> path) const
+    {
+        std::ostringstream out;
+        out << "{ name = " << quoteLua(field.name)
+            << ", type = " << emitLuaAbiType(field.type, level, std::move(path)) << " }";
+        return out.str();
+    }
+
+    std::string emitLuaAbiRecordType(const RecordInfo &record, int level, std::vector<std::string> path) const
+    {
+        std::ostringstream out;
+        const std::string ctor = record.kind == "union" ? "ffi.type.union" : "ffi.type.struct";
+        out << ctor << "({";
+        path.push_back(record.key);
+        if (!record.fields.empty()) out << "\n";
+        for (std::size_t i = 0; i < record.fields.size(); ++i) {
+            out << indent(level + 1) << emitLuaAbiField(record.fields[i], level + 1, path) << ',';
+            out << "\n";
+        }
+        out << indent(level) << "}";
+        const std::string name = preferredRecordName(record);
+        if (!name.empty()) {
+            out << ", { name = " << quoteLua(name) << " }";
+        }
+        out << ")";
+        return out.str();
+    }
+
+    std::string emitLuaAbiType(const TypeInfo &type, int level, std::vector<std::string> path) const
+    {
+        switch (type.kind) {
+        case TypeInfo::Kind::Primitive:
+            if (type.urbName == "void") return "ffi.type.void()";
+            return "ffi.type." + sanitizeIdentifier(type.urbName) + "()";
+        case TypeInfo::Kind::CString:
+            return "ffi.type.cstring()";
+        case TypeInfo::Kind::Pointer:
+            if (!type.pointee) return "ffi.type.pointer()";
+            return "ffi.type.pointer(" + emitLuaAbiType(*type.pointee, level, std::move(path)) + ")";
+        case TypeInfo::Kind::Function: {
+            if (!type.functionResult) return "nil";
+            std::ostringstream out;
+            out << "ffi.type.func(" << emitLuaAbiType(*type.functionResult, level, {}) << ", {";
+            if (!type.functionArgs.empty()) out << "\n";
+            for (std::size_t i = 0; i < type.functionArgs.size(); ++i) {
+                out << indent(level + 1) << (type.functionArgs[i] ? emitLuaAbiType(*type.functionArgs[i], level + 1, {}) : std::string("ffi.type.pointer()")) << ',';
+                out << "\n";
+            }
+            out << indent(level) << "}";
+            if (type.functionVariadic) out << ", { varargs = true }";
+            out << ")";
+            return out.str();
+        }
+        case TypeInfo::Kind::Enum: {
+            const std::string enumName = preferredEnumName(type.enumInfo);
+            if (enumName.empty()) return "ffi.type." + sanitizeIdentifier(type.urbName) + "()";
+            return "ffi.type.enum(ENUMS[" + quoteLua(enumName) + "], { underlying = ffi.type." + sanitizeIdentifier(type.urbName) + "() })";
+        }
+        case TypeInfo::Kind::Array:
+            if (!type.element) return "nil";
+            return "ffi.type.array(" + emitLuaAbiType(*type.element, level, std::move(path)) + ", " + std::to_string(type.arrayCount) + ")";
+        case TypeInfo::Kind::Record:
+            if (!type.record) return "nil";
+            return emitLuaAbiRecordType(*type.record, level, std::move(path));
+        case TypeInfo::Kind::Unsupported:
+            return "nil";
+        }
+        return "nil";
+    }
+
+    std::string emitLuaFunctionDescriptor(const FunctionInfo &fn, int level) const
+    {
+        std::ostringstream out;
+        out << "ffi.type.func(" << emitLuaAbiType(fn.result, level, {}) << ", {";
+        if (!fn.params.empty()) out << "\n";
+        for (std::size_t i = 0; i < fn.params.size(); ++i) {
+            out << indent(level + 1) << emitLuaAbiType(fn.params[i].type, level + 1, {}) << ',';
+            out << "\n";
+        }
+        out << indent(level) << "}, { name = " << quoteLua(fn.name);
+        if (fn.variadic) out << ", varargs = true";
+        out << " })";
+        return out.str();
+    }
+
     std::string emitNode() const
     {
         const auto records = exportedRecords();
@@ -1655,6 +1948,7 @@ private:
         const auto functions = callableFunctions();
         const auto unsupportedFunctions = unsupportedWrapperFunctions();
         const bool needsShims = hasShimmedFunctions(functions);
+        const bool needsRecordWrappers = needsRecordHelpers(functions);
         std::ostringstream out;
         out << "'use strict';\n\n";
         out << "// Generated by urb-bindgen.\n";
@@ -1724,9 +2018,14 @@ private:
         }
         out << "});\n\n";
 
-        if (needsShims) {
-            out << "function isPointerLike(value) {\n";
-            out << indent(1) << "return value != null && (typeof value === 'number' || typeof value === 'bigint' || Buffer.isBuffer(value) || (typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, 'ptr')));\n";
+        if (needsRecordWrappers) {
+            out << "function schemaHasField(schema, fieldName) {\n";
+            out << indent(1) << "return !!schema && typeof schema === 'object' && !Array.isArray(schema) && Object.prototype.hasOwnProperty.call(schema, fieldName);\n";
+            out << "}\n\n";
+            out << "function isPointerLike(value, schema = null) {\n";
+            out << indent(1) << "if (value == null) return false;\n";
+            out << indent(1) << "if (typeof value === 'number' || typeof value === 'bigint' || Buffer.isBuffer(value)) return true;\n";
+            out << indent(1) << "return typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, 'ptr') && !schemaHasField(schema, 'ptr');\n";
             out << "}\n\n";
             out << "function pointerValue(value) {\n";
             out << indent(1) << "return value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, 'ptr') ? value.ptr : value;\n";
@@ -1739,7 +2038,7 @@ private:
             out << "}\n\n";
             out << "function copyRecord(memory, schema, ptr, value) {\n";
             out << indent(1) << "const size = BigInt(memory.struct_sizeof(schema));\n";
-            out << indent(1) << "if (isPointerLike(value)) {\n";
+            out << indent(1) << "if (isPointerLike(value, schema)) {\n";
             out << indent(2) << "memory.copy(ptr, pointerValue(value), size);\n";
             out << indent(2) << "return;\n";
             out << indent(1) << "}\n";
@@ -1778,7 +2077,7 @@ private:
             out << indent(1) << "return out;\n";
             out << "}\n\n";
             out << "function prepareRecordArg(memory, schema, value) {\n";
-            out << indent(1) << "if (isPointerLike(value)) return { ptr: pointerValue(value), owned: false };\n";
+            out << indent(1) << "if (isPointerLike(value, schema)) return { ptr: pointerValue(value), owned: false };\n";
             out << indent(1) << "const ptr = memory.alloc(BigInt(memory.struct_sizeof(schema)));\n";
             out << indent(1) << "copyRecord(memory, schema, ptr, value);\n";
             out << indent(1) << "return { ptr, owned: true };\n";
@@ -1828,9 +2127,46 @@ private:
         bool emittedFunction = false;
         for (const auto &fn : functions) {
             emittedFunction = true;
-            if (fn.direct) {
+            if (fn.direct && !fn.richDirect) {
                 out << indent(2) << quoteJs(fn.fn.name) << ": bindRequired(ffi, handle, " << quoteJs(fn.bindSymbol)
                     << ", " << quoteJs(fn.bindSignature) << ", 'target'),\n";
+                continue;
+            }
+
+            if (fn.direct && fn.richDirect) {
+                out << indent(2) << quoteJs(fn.fn.name) << ": (() => {\n";
+                out << indent(3) << "const __fn = bindRequired(ffi, handle, " << quoteJs(fn.bindSymbol)
+                    << ", " << emitNodeFunctionDescriptor(fn.fn, 3) << ", 'target');\n";
+                out << indent(3) << "return (";
+                for (std::size_t i = 0; i < fn.fn.params.size(); ++i) {
+                    if (i) out << ", ";
+                    out << "arg" << i;
+                }
+                out << ") => {\n";
+                for (std::size_t i = 0; i < fn.fn.params.size(); ++i) {
+                    if (!fn.paramByValueRecord[i]) continue;
+                    out << indent(4) << "const __arg" << i << " = prepareRecordArg(memory, RECORDS[" << quoteJs(wrapperRecordKey(fn.fn.params[i].type)) << "], arg" << i << ");\n";
+                }
+                out << indent(4) << "try {\n";
+                out << indent(5) << "const __result = __fn(";
+                for (std::size_t i = 0; i < fn.fn.params.size(); ++i) {
+                    if (i) out << ", ";
+                    out << (fn.paramByValueRecord[i] ? ("__arg" + std::to_string(i) + ".ptr") : ("arg" + std::to_string(i)));
+                }
+                out << ");\n";
+                if (fn.returnsByValueRecord) {
+                    out << indent(5) << "return snapshotRecord(memory, RECORDS[" << quoteJs(wrapperRecordKey(fn.fn.result)) << "], __result);\n";
+                } else {
+                    out << indent(5) << "return __result;\n";
+                }
+                out << indent(4) << "} finally {\n";
+                for (std::size_t i = 0; i < fn.fn.params.size(); ++i) {
+                    if (!fn.paramByValueRecord[i]) continue;
+                    out << indent(5) << "freePreparedRecord(memory, __arg" << i << ");\n";
+                }
+                out << indent(4) << "}\n";
+                out << indent(3) << "};\n";
+                out << indent(2) << "})(),\n";
                 continue;
             }
 
@@ -1842,11 +2178,11 @@ private:
             out << ") => {\n";
             out << indent(3) << "const __fn = getShimBinding(" << quoteJs(fn.bindSymbol) << ", " << quoteJs(fn.bindSignature) << ");\n";
             if (fn.returnsViaOutPointer) {
-                out << indent(3) << "const __retPtr = memory.alloc(BigInt(memory.struct_sizeof(RECORDS[" << quoteJs(recordSchemaName(fn.fn.result)) << "])));\n";
+                out << indent(3) << "const __retPtr = memory.alloc(BigInt(memory.struct_sizeof(RECORDS[" << quoteJs(wrapperRecordKey(fn.fn.result)) << "])));\n";
             }
             for (std::size_t i = 0; i < fn.fn.params.size(); ++i) {
                 if (!fn.paramByValueRecord[i]) continue;
-                out << indent(3) << "const __arg" << i << " = prepareRecordArg(memory, RECORDS[" << quoteJs(recordSchemaName(fn.fn.params[i].type)) << "], arg" << i << ");\n";
+                out << indent(3) << "const __arg" << i << " = prepareRecordArg(memory, RECORDS[" << quoteJs(wrapperRecordKey(fn.fn.params[i].type)) << "], arg" << i << ");\n";
             }
             out << indent(3) << "try {\n";
             out << indent(4);
@@ -1863,7 +2199,7 @@ private:
             }
             out << ");\n";
             if (fn.returnsViaOutPointer) {
-                out << indent(4) << "return snapshotRecord(memory, RECORDS[" << quoteJs(recordSchemaName(fn.fn.result)) << "], __retPtr);\n";
+                out << indent(4) << "return snapshotRecord(memory, RECORDS[" << quoteJs(wrapperRecordKey(fn.fn.result)) << "], __retPtr);\n";
             }
             out << indent(3) << "} finally {\n";
             for (std::size_t i = 0; i < fn.fn.params.size(); ++i) {
@@ -1917,6 +2253,7 @@ private:
         const auto functions = callableFunctions();
         const auto unsupportedFunctions = unsupportedWrapperFunctions();
         const bool needsShims = hasShimmedFunctions(functions);
+        const bool needsRecordWrappers = needsRecordHelpers(functions);
         std::ostringstream out;
         out << "-- Generated by urb-bindgen.\n";
         out << "-- Module: " << options_.moduleName << "\n\n";
@@ -1984,9 +2321,15 @@ private:
         }
         out << "}\n\n";
 
-        if (needsShims) {
-            out << "local function is_pointer_like(value)\n";
-            out << indent(1) << "return type(value) == 'number' or (type(value) == 'table' and value.ptr ~= nil)\n";
+        if (needsRecordWrappers) {
+            out << "local function schema_has_field(schema, field_name)\n";
+            out << indent(1) << "for _, field in ipairs(schema or {}) do\n";
+            out << indent(2) << "if field.name == field_name then return true end\n";
+            out << indent(1) << "end\n";
+            out << indent(1) << "return false\n";
+            out << "end\n\n";
+            out << "local function is_pointer_like(value, schema)\n";
+            out << indent(1) << "return type(value) == 'number' or (type(value) == 'table' and value.ptr ~= nil and not schema_has_field(schema, 'ptr'))\n";
             out << "end\n\n";
             out << "local function pointer_value(value)\n";
             out << indent(1) << "return type(value) == 'table' and value.ptr ~= nil and value.ptr or value\n";
@@ -1996,7 +2339,7 @@ private:
             out << "end\n\n";
             out << "local function copy_record(memory, schema, ptr, value)\n";
             out << indent(1) << "local size = memory.struct_sizeof(schema)\n";
-            out << indent(1) << "if is_pointer_like(value) then\n";
+            out << indent(1) << "if is_pointer_like(value, schema) then\n";
             out << indent(2) << "memory.copy(ptr, pointer_value(value), size)\n";
             out << indent(2) << "return\n";
             out << indent(1) << "end\n";
@@ -2034,7 +2377,7 @@ private:
             out << indent(1) << "return out\n";
             out << "end\n\n";
             out << "local function prepare_record_arg(memory, schema, value)\n";
-            out << indent(1) << "if is_pointer_like(value) then return { ptr = pointer_value(value), owned = false } end\n";
+            out << indent(1) << "if is_pointer_like(value, schema) then return { ptr = pointer_value(value), owned = false } end\n";
             out << indent(1) << "local ptr = memory.alloc(memory.struct_sizeof(schema))\n";
             out << indent(1) << "copy_record(memory, schema, ptr, value)\n";
             out << indent(1) << "return { ptr = ptr, owned = true }\n";
@@ -2086,9 +2429,47 @@ private:
         bool emittedFunction = false;
         for (const auto &fn : functions) {
             emittedFunction = true;
-            if (fn.direct) {
+            if (fn.direct && !fn.richDirect) {
                 out << indent(2) << "[" << quoteLua(fn.fn.name) << "] = bind_required(ffi, handle, " << quoteLua(fn.bindSymbol)
                     << ", " << quoteLua(fn.bindSignature) << ", 'target'),\n";
+                continue;
+            }
+
+            if (fn.direct && fn.richDirect) {
+                out << indent(2) << "[" << quoteLua(fn.fn.name) << "] = (function()\n";
+                out << indent(3) << "local __fn = bind_required(ffi, handle, " << quoteLua(fn.bindSymbol)
+                    << ", " << emitLuaFunctionDescriptor(fn.fn, 3) << ", 'target')\n";
+                out << indent(3) << "return function(";
+                for (std::size_t i = 0; i < fn.fn.params.size(); ++i) {
+                    if (i) out << ", ";
+                    out << "arg" << i;
+                }
+                out << ")\n";
+                for (std::size_t i = 0; i < fn.fn.params.size(); ++i) {
+                    if (!fn.paramByValueRecord[i]) continue;
+                    out << indent(4) << "local __arg" << i << " = prepare_record_arg(memory, RECORDS[" << quoteLua(wrapperRecordKey(fn.fn.params[i].type)) << "], arg" << i << ")\n";
+                }
+                out << indent(4) << "local ok, result = pcall(function()\n";
+                out << indent(5) << "local __result = __fn(";
+                for (std::size_t i = 0; i < fn.fn.params.size(); ++i) {
+                    if (i) out << ", ";
+                    out << (fn.paramByValueRecord[i] ? ("__arg" + std::to_string(i) + ".ptr") : ("arg" + std::to_string(i)));
+                }
+                out << ")\n";
+                if (fn.returnsByValueRecord) {
+                    out << indent(5) << "return snapshot_record(memory, RECORDS[" << quoteLua(wrapperRecordKey(fn.fn.result)) << "], __result)\n";
+                } else {
+                    out << indent(5) << "return __result\n";
+                }
+                out << indent(4) << "end)\n";
+                for (std::size_t i = 0; i < fn.fn.params.size(); ++i) {
+                    if (!fn.paramByValueRecord[i]) continue;
+                    out << indent(4) << "free_prepared_record(memory, __arg" << i << ")\n";
+                }
+                out << indent(4) << "if not ok then error(result, 0) end\n";
+                out << indent(4) << "return result\n";
+                out << indent(3) << "end\n";
+                out << indent(2) << "end)(),\n";
                 continue;
             }
 
@@ -2100,11 +2481,11 @@ private:
             out << ")\n";
             out << indent(3) << "local __fn = get_shim_binding(" << quoteLua(fn.bindSymbol) << ", " << quoteLua(fn.bindSignature) << ")\n";
             if (fn.returnsViaOutPointer) {
-                out << indent(3) << "local __ret_ptr = memory.alloc(memory.struct_sizeof(RECORDS[" << quoteLua(recordSchemaName(fn.fn.result)) << "]))\n";
+                out << indent(3) << "local __ret_ptr = memory.alloc(memory.struct_sizeof(RECORDS[" << quoteLua(wrapperRecordKey(fn.fn.result)) << "]))\n";
             }
             for (std::size_t i = 0; i < fn.fn.params.size(); ++i) {
                 if (!fn.paramByValueRecord[i]) continue;
-                out << indent(3) << "local __arg" << i << " = prepare_record_arg(memory, RECORDS[" << quoteLua(recordSchemaName(fn.fn.params[i].type)) << "], arg" << i << ")\n";
+                out << indent(3) << "local __arg" << i << " = prepare_record_arg(memory, RECORDS[" << quoteLua(wrapperRecordKey(fn.fn.params[i].type)) << "], arg" << i << ")\n";
             }
             out << indent(3) << "local ok, result = pcall(function()\n";
             out << indent(4);
@@ -2121,7 +2502,7 @@ private:
             }
             out << ")\n";
             if (fn.returnsViaOutPointer) {
-                out << indent(4) << "return snapshot_record(memory, RECORDS[" << quoteLua(recordSchemaName(fn.fn.result)) << "], __ret_ptr)\n";
+                out << indent(4) << "return snapshot_record(memory, RECORDS[" << quoteLua(wrapperRecordKey(fn.fn.result)) << "], __ret_ptr)\n";
             }
             out << indent(3) << "end)\n";
             for (std::size_t i = 0; i < fn.fn.params.size(); ++i) {
@@ -2194,10 +2575,16 @@ private:
     {
         switch (type.kind) {
         case TypeInfo::Kind::Primitive:
-        case TypeInfo::Kind::Pointer:
         case TypeInfo::Kind::CString:
         case TypeInfo::Kind::Enum:
             return quoteJs(type.urbName);
+        case TypeInfo::Kind::Pointer:
+            if (type.pointee && type.pointee->kind == TypeInfo::Kind::Record && type.pointee->record) {
+                return "{ type: " + quoteJs("pointer") + ", to: " + emitNodeRecord(*type.pointee->record, level, std::move(path)) + " }";
+            }
+            return quoteJs(type.urbName);
+        case TypeInfo::Kind::Function:
+            return quoteJs("pointer");
         case TypeInfo::Kind::Array:
             return "[" + quoteJs(type.element ? type.element->urbName : std::string("u8")) + ", " + std::to_string(type.arrayCount) + "]";
         case TypeInfo::Kind::Record:
@@ -2237,6 +2624,14 @@ private:
             out << ", type = " << quoteLua(field.type.urbName);
             break;
         case TypeInfo::Kind::Pointer:
+            if (field.type.pointee && field.type.pointee->kind == TypeInfo::Kind::Record && field.type.pointee->record) {
+                out << ", type = " << quoteLua("pointer")
+                    << ", to = " << emitLuaRecord(*field.type.pointee->record, level, std::move(path));
+            } else {
+                out << ", pointer = true";
+            }
+            break;
+        case TypeInfo::Kind::Function:
             out << ", pointer = true";
             break;
         case TypeInfo::Kind::Array:

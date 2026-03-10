@@ -7,6 +7,7 @@ AMALGAMATED_HEADER := $(DIST_DIR)/urbc.h
 AMALGAMATED_CLI := $(DIST_DIR)/urbccli.c
 AMALGAMATE_INPUTS := $(AMALGAMATE) $(ROOT)/include/urb.h $(ROOT)/src/urbc_internal.h $(wildcard $(ROOT)/include/urbc/*.h) $(wildcard $(ROOT)/src/*.c)
 LUA_BIN := $(shell command -v $(LUA) 2>/dev/null)
+SUF := $(shell echo "$(shell uname)" | grep -qi darwin && echo .dylib || echo .so)
 PKG_CONFIG ?= pkg-config
 
 LUA_PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags lua5.4 2>/dev/null || $(PKG_CONFIG) --cflags lua-5.4 2>/dev/null || true)
@@ -78,9 +79,13 @@ $(DIST_DIR)/:
 	mkdir -p $(DIST_DIR)
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJS) $(TARGET) $(CURDIR)/examples/libbyvalue*
 
-test: all
+examples/libbyvalue$(SUF): $(CURDIR)/examples/byvalue.c
+	@echo "[CC] building byvalue library"
+	$(CC) -shared -fPIC -pthread -o $@ $<
+
+test: all examples/libbyvalue$(SUF)
 	@if [ -z "$(LUA_BIN)" ]; then \
 		echo "lua5.4 interpreter not found in PATH" >&2; \
 		exit 1; \
@@ -89,5 +94,7 @@ test: all
 	@echo "=== lua manual_types ===" && $(LUA_BIN) examples/manual_types.lua
 	@echo "=== lua memory ===" && $(LUA_BIN) examples/memory.lua
 	@echo "=== lua view ===" && $(LUA_BIN) examples/view.lua
+	@echo "=== lua memory_phase6 ===" && $(LUA_BIN) examples/memory_phase6.lua
 	@echo "=== lua callback ===" && $(LUA_BIN) examples/callback.lua
 	@echo "=== lua sym_self ===" && $(LUA_BIN) examples/sym_self.lua
+	@echo "=== lua byvalue ===" && $(LUA_BIN) examples/byvalue.lua

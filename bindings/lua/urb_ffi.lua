@@ -125,7 +125,7 @@ local function normalize_type(type_name)
     return normalized
 end
 
-local compile_schema
+local compile_schema, compile_abi_field, is_abi_type, normalize_abi_type, abi_type_to_layout_schema, abi_type_size
 
 local function compile_field(entry)
     if type(entry) ~= "table" then
@@ -135,12 +135,18 @@ local function compile_field(entry)
         error("schema field must have a non-empty name", 4)
     end
 
+    if is_abi_type and is_abi_type(entry.type) then
+        return compile_abi_field(entry.name, entry.type, entry)
+    end
+
     if entry.pointer or entry.__pointer then
         return {
             name = entry.name,
             kind = "pointer",
             size = PTR_SIZE,
             align = PTR_SIZE,
+            to_schema = entry.to and type(entry.to) == "table" and not (is_abi_type and is_abi_type(entry.to)) and entry.to or nil,
+            to_type = entry.to and is_abi_type and is_abi_type(entry.to) and entry.to or nil,
         }
     end
 
@@ -161,6 +167,16 @@ local function compile_field(entry)
 
     local normalized = normalize_type(entry.type)
     local info = TYPE_INFO[normalized]
+    if entry.flexible then
+        return {
+            name = entry.name,
+            kind = "flex_array",
+            type = normalized,
+            elem_size = info.size,
+            size = 0,
+            align = info.align,
+        }
+    end
     if entry.count ~= nil then
         local count = to_non_negative_int(entry.count, "array count for " .. entry.name)
         if count == 0 then
@@ -171,6 +187,7 @@ local function compile_field(entry)
             kind = "array",
             type = normalized,
             count = count,
+            elem_size = info.size,
             size = info.size * count,
             align = info.align,
         }
@@ -182,6 +199,8 @@ local function compile_field(entry)
             kind = "pointer",
             size = info.size,
             align = info.align,
+            to_schema = entry.to and type(entry.to) == "table" and not (is_abi_type and is_abi_type(entry.to)) and entry.to or nil,
+            to_type = entry.to and is_abi_type and is_abi_type(entry.to) and entry.to or nil,
         }
     end
 
@@ -192,6 +211,43 @@ local function compile_field(entry)
         size = info.size,
         align = info.align,
     }
+end
+
+compile_abi_field = function(name, abi_type_value, options)
+    options = options or {}
+    local abi_type = normalize_abi_type(abi_type_value, "field " .. tostring(name) .. " type")
+    local to_schema = options.to and type(options.to) == "table" and not is_abi_type(options.to) and options.to or nil
+    local to_type = options.to and is_abi_type(options.to) and options.to or nil
+
+    if abi_type.kind == "primitive" then
+        local info = TYPE_INFO[abi_type.name]
+        return { name = name, kind = "prim", type = abi_type.name, size = info.size, align = info.align }
+    elseif abi_type.kind == "enum" then
+        local size = abi_type_size(abi_type)
+        local align = abi_type_size(abi_type.underlying)
+        return { name = name, kind = "enum", abi_type = abi_type, size = size, align = align }
+    elseif abi_type.kind == "cstring" then
+        return { name = name, kind = "pointer", size = PTR_SIZE, align = PTR_SIZE, to_type = abi_type }
+    elseif abi_type.kind == "function" then
+        return { name = name, kind = "fnptr", fn_type = abi_type, size = PTR_SIZE, align = PTR_SIZE }
+    elseif abi_type.kind == "pointer" then
+        if abi_type.to and abi_type.to.kind == "function" then
+            return { name = name, kind = "fnptr", fn_type = abi_type.to, size = PTR_SIZE, align = PTR_SIZE }
+        end
+        return {
+            name = name,
+            kind = "pointer",
+            size = PTR_SIZE,
+            align = PTR_SIZE,
+            to_schema = to_schema,
+            to_type = to_type or abi_type.to or nil,
+        }
+    elseif abi_type.kind == "struct" or abi_type.kind == "union" then
+        local schema = compile_schema(abi_type_to_layout_schema(abi_type))
+        return { name = name, kind = "struct", schema = schema, abi_type = abi_type, size = schema.size, align = schema.align }
+    end
+
+    error("unsupported schema ABI field type for " .. tostring(name) .. ": " .. tostring(abi_type.kind), 3)
 end
 
 compile_schema = function(schema)
@@ -211,14 +267,98 @@ compile_schema = function(schema)
         local kind = schema.__union and "union" or "struct"
         local fields = {}
         local field_map = {}
+        local schema_entries = {}
+        local flexible_index = nil
         local offset = 0
         local max_align = 1
         local max_size = 0
 
-        for i, entry in ipairs(schema) do
+        local function push_named_entry(field_name, desc)
+            if type(field_name) ~= "string" or field_name == "" then
+                error("schema field must have a non-empty name", 4)
+            end
+
+            if is_abi_type and is_abi_type(desc) then
+                schema_entries[#schema_entries + 1] = { name = field_name, type = desc }
+                return
+            end
+
+            if type(desc) == "string" then
+                schema_entries[#schema_entries + 1] = { name = field_name, type = desc }
+                return
+            end
+
+            if type(desc) ~= "table" then
+                error("invalid field descriptor for " .. field_name, 4)
+            end
+
+            if rawget(desc, 1) ~= nil and rawget(desc, 2) ~= nil and rawget(desc, 3) == nil and type(rawget(desc, 1)) == "string" then
+                schema_entries[#schema_entries + 1] = {
+                    name = field_name,
+                    type = desc[1],
+                    count = desc[2],
+                }
+                return
+            end
+
+            if desc.__pointer then
+                schema_entries[#schema_entries + 1] = {
+                    name = field_name,
+                    pointer = true,
+                    to = desc.to,
+                }
+                return
+            end
+
+            if desc.name ~= nil or desc.type ~= nil or desc.schema ~= nil
+                or desc.pointer ~= nil or desc.__pointer ~= nil
+                or desc.count ~= nil or desc.flexible ~= nil then
+                local entry = {}
+                for k, v in pairs(desc) do
+                    entry[k] = v
+                end
+                entry.name = field_name
+                schema_entries[#schema_entries + 1] = entry
+                return
+            end
+
+            schema_entries[#schema_entries + 1] = { name = field_name, schema = desc }
+        end
+
+        if #schema > 0 then
+            for i, entry in ipairs(schema) do
+                schema_entries[i] = entry
+            end
+        else
+            local ordered_names = {}
+            if type(schema.__fields) == "table" and #schema.__fields > 0 then
+                for i = 1, #schema.__fields do
+                    ordered_names[#ordered_names + 1] = schema.__fields[i]
+                end
+            else
+                for name in pairs(schema) do
+                    if type(name) == "string" and not name:match("^__") then
+                        ordered_names[#ordered_names + 1] = name
+                    end
+                end
+                table.sort(ordered_names)
+            end
+
+            for i = 1, #ordered_names do
+                local field_name = ordered_names[i]
+                if type(field_name) == "string" and not field_name:match("^__") then
+                    push_named_entry(field_name, schema[field_name])
+                end
+            end
+        end
+
+        for i, entry in ipairs(schema_entries) do
             local field = compile_field(entry)
             if field_map[field.name] then
                 error("duplicate field name: " .. field.name, 4)
+            end
+            if field.kind == "flex_array" then
+                flexible_index = i
             end
             max_align = math.max(max_align, field.align)
             if kind == "union" then
@@ -233,10 +373,20 @@ compile_schema = function(schema)
             field_map[field.name] = field
         end
 
+        if flexible_index ~= nil then
+            if kind == "union" then
+                error("flexible array members are not allowed in unions", 4)
+            end
+            if flexible_index ~= #fields then
+                error("flexible array members must be the last field", 4)
+            end
+        end
+
         return {
             kind = kind,
             align = max_align,
             size = align_up(kind == "union" and max_size or offset, max_align),
+            has_flexible_array = flexible_index ~= nil,
             fields = fields,
             field_map = field_map,
         }
@@ -305,13 +455,47 @@ end
 
 local create_view
 
+local function resolve_schema_total_size(schema_meta, total_size)
+    if not schema_meta.has_flexible_array then return schema_meta.size end
+    if total_size == nil then return schema_meta.size end
+    local size = to_non_negative_int(total_size, "total_size")
+    if size < schema_meta.size then
+        error("total_size must be at least " .. tostring(schema_meta.size), 3)
+    end
+    return size
+end
+
+local function nested_schema_total_size(field, total_size)
+    if not field.schema or not field.schema.has_flexible_array then return nil end
+    if total_size == nil then return nil end
+    local size = to_non_negative_int(total_size, "total_size")
+    return math.max(0, size - field.offset)
+end
+
+local function schema_field_count(field, total_size)
+    if field.kind ~= "flex_array" then return field.count end
+    if total_size == nil then
+        error("field " .. tostring(field.name) .. " requires total_size for flexible array access", 3)
+    end
+    local size = to_non_negative_int(total_size, "total_size")
+    if size < field.offset then return 0 end
+    return math.floor((size - field.offset) / field.elem_size)
+end
+
+local copy_schema_value_to_memory
+local create_pointer_reference
+local read_schema_field_value
+local write_schema_field_value
+
 local function create_view_array(ptr, schema_meta, count)
     local length = to_non_negative_int(count, "count")
     local size = schema_meta.size
-    return setmetatable({ ptr = ptr, count = length, length = length }, {
+    local byte_size = size * length
+    return setmetatable({ ptr = ptr, count = length, length = length, byte_size = byte_size }, {
         __index = function(_, key)
             if key == "ptr" then return ptr end
             if key == "count" or key == "length" then return length end
+            if key == "byte_size" or key == "byteSize" then return byte_size end
             if type(key) == "number" and key % 1 == 0 and key >= 1 and key <= length then
                 return create_view(ptr + (key - 1) * size, schema_meta)
             end
@@ -323,23 +507,16 @@ local function create_view_array(ptr, schema_meta, count)
     })
 end
 
-create_view = function(ptr, schema_meta)
-    return setmetatable({ ptr = ptr }, {
+create_view = function(ptr, schema_meta, total_size)
+    local byte_size = resolve_schema_total_size(schema_meta, total_size)
+    return setmetatable({ ptr = ptr, byte_size = byte_size }, {
         __index = function(_, key)
             if key == "ptr" then return ptr end
+            if key == "byte_size" or key == "byteSize" then return byte_size end
             local field = schema_meta.field_map[key]
             if not field then return nil end
             local addr = ptr + field.offset
-            if field.kind == "prim" then
-                return read_primitive(addr, field.type)
-            elseif field.kind == "pointer" then
-                return native.readptr(addr)
-            elseif field.kind == "array" then
-                return read_array(addr, field.type, field.count)
-            elseif field.kind == "struct" then
-                return create_view(addr, field.schema)
-            end
-            return nil
+            return read_schema_field_value(addr, field, byte_size)
         end,
         __newindex = function(_, key, value)
             local field = schema_meta.field_map[key]
@@ -348,15 +525,7 @@ create_view = function(ptr, schema_meta)
                 return
             end
             local addr = ptr + field.offset
-            if field.kind == "prim" then
-                write_primitive(addr, field.type, value)
-                return
-            end
-            if field.kind == "pointer" then
-                native.writeptr(addr, value)
-                return
-            end
-            error("field " .. tostring(key) .. " is not directly assignable", 2)
+            write_schema_field_value(addr, field, value, byte_size)
         end,
     })
 end
@@ -371,7 +540,7 @@ local function make_abi_type(kind, props)
     return out
 end
 
-local function is_abi_type(value)
+is_abi_type = function(value)
     return type(value) == "table" and value.__ffi_abi_type == true
 end
 
@@ -390,7 +559,7 @@ local function sanitize_abi_name(name)
     return safe
 end
 
-local function normalize_abi_type(value, what)
+normalize_abi_type = function(value, what)
     what = what or "type"
     if is_abi_type(value) then
         return value
@@ -554,7 +723,29 @@ end
 local function describe_function_type(fn_type)
     local sig = abi_function_to_string(fn_type)
     local native_sig = abi_function_to_native_signature(fn_type)
-    local handle = native_sig and native.describe(native_sig) or nil
+    local handle = nil
+    if native_sig then
+        handle = native.describe(native_sig)
+    else
+        local layouts = { ret = nil, args = {} }
+        local ok_ret, ret_layout = pcall(abi_type_to_layout_schema, fn_type.ret)
+        if ok_ret then
+            layouts.ret = ret_layout
+        end
+        for i = 1, #fn_type.args do
+            local ok_arg, arg_layout = pcall(abi_type_to_layout_schema, fn_type.args[i])
+            if ok_arg then
+                layouts.args[i] = arg_layout
+            end
+        end
+        local ok_desc, result = pcall(native.describe_descriptor, {
+            type = fn_type,
+            layouts = layouts,
+        })
+        if ok_desc then
+            handle = result
+        end
+    end
     return create_ffi_descriptor(sig, handle, fn_type, native_sig or sig)
 end
 
@@ -573,7 +764,7 @@ local function ensure_ffi_descriptor(value, context)
     error(context .. " expects a signature string, ffi.type.func(...), or descriptor", 3)
 end
 
-local function abi_type_to_layout_schema(value)
+abi_type_to_layout_schema = function(value)
     local abi_type = normalize_abi_type(value)
     if abi_type.kind == "primitive" then
         return abi_type.name
@@ -590,17 +781,18 @@ local function abi_type_to_layout_schema(value)
         end
         return { element, abi_type.length }
     elseif abi_type.kind == "struct" or abi_type.kind == "union" then
-        local schema = abi_type.kind == "union" and { __union = true } or {}
+        local schema = abi_type.kind == "union" and { __union = true, __fields = {} } or { __fields = {} }
         for i = 1, #abi_type.fields do
             local field = abi_type.fields[i]
             schema[field.name] = abi_type_to_layout_schema(field.type)
+            schema.__fields[i] = field.name
         end
         return schema
     end
     error("type " .. abi_type_to_string(abi_type) .. " cannot be converted to a memory layout", 3)
 end
 
-local function abi_type_size(value)
+abi_type_size = function(value)
     local abi_type = normalize_abi_type(value)
     if abi_type.kind == "void" then
         return 0
@@ -725,6 +917,286 @@ local function create_array_global(ptr, abi_type_value)
     })
 end
 
+local function abi_type_has_field(value, field_name)
+    local abi_type = normalize_abi_type(value)
+    if abi_type.kind ~= "struct" and abi_type.kind ~= "union" then
+        return false
+    end
+    for i = 1, #abi_type.fields do
+        if abi_type.fields[i].name == field_name then
+            return true
+        end
+    end
+    return false
+end
+
+local function is_pointer_like(value, expected_type)
+    if value == nil then return false end
+    local t = type(value)
+    if t == "number" then return true end
+    if t == "table" and rawget(value, "ptr") ~= nil then
+        return expected_type == nil or not abi_type_has_field(expected_type, "ptr")
+    end
+    return false
+end
+
+local function pointer_value(value)
+    if type(value) == "table" and value ~= nil and rawget(value, "ptr") ~= nil then
+        return rawget(value, "ptr")
+    end
+    return value
+end
+
+local function pointer_is_null(value)
+    if value == nil then return true end
+    return pointer_value(value) == 0
+end
+
+local function copy_abi_value_to_memory(ptr, abi_type_value, value)
+    local abi_type = normalize_abi_type(abi_type_value)
+
+    if abi_type.kind == "primitive" or abi_type.kind == "enum"
+        or abi_type.kind == "cstring" or abi_type.kind == "pointer" or abi_type.kind == "function" then
+        write_abi_value(ptr, abi_type, is_pointer_like(value, abi_type) and pointer_value(value) or value)
+        return
+    elseif abi_type.kind == "array" then
+        local total_size = abi_type_size(abi_type)
+        if is_pointer_like(value, abi_type) then
+            native.copy(ptr, pointer_value(value), total_size)
+            return
+        end
+        native.zero(ptr, total_size)
+        if value == nil then return end
+        if type(value) ~= "table" then
+            error("expected table value for " .. abi_type_to_string(abi_type), 3)
+        end
+        local stride = abi_type_size(abi_type.element)
+        for i = 1, abi_type.length do
+            if rawget(value, i) ~= nil then
+                copy_abi_value_to_memory(ptr + (i - 1) * stride, abi_type.element, value[i])
+            end
+        end
+        return
+    elseif abi_type.kind == "struct" or abi_type.kind == "union" then
+        local total_size = abi_type_size(abi_type)
+        local schema_meta = compile_schema(abi_type_to_layout_schema(abi_type))
+        if is_pointer_like(value, abi_type) then
+            native.copy(ptr, pointer_value(value), total_size)
+            return
+        end
+        native.zero(ptr, total_size)
+        if value == nil then return end
+        if type(value) ~= "table" then
+            error("expected table value for " .. abi_type_to_string(abi_type), 3)
+        end
+        copy_schema_value_to_memory(ptr, schema_meta, value, total_size)
+        return
+    end
+
+    error("unsupported callback ABI type: " .. tostring(abi_type.kind), 3)
+end
+
+local ffi
+local memory
+
+local function create_bound_callable(ptr, descriptor, context)
+    context = context or "ffi.bind"
+    local desc = ensure_ffi_descriptor(descriptor, context)
+    if desc.handle == nil then
+        error(context .. " descriptor is not natively callable yet: " .. tostring(desc.sig), 3)
+    end
+    local fn_ptr = pointer_value(ptr)
+    local handle = native.bind(fn_ptr, desc.handle)
+    return setmetatable({
+        ptr = fn_ptr,
+        handle = handle,
+        sig = tostring(desc.sig or ""),
+        descriptor = desc,
+    }, {
+        __call = function(self, ...)
+            return native.call_bound(self.handle, { ... })
+        end,
+    })
+end
+
+local function wrap_callback_argument(value, abi_type_value)
+    local abi_type = normalize_abi_type(abi_type_value)
+    if (abi_type.kind == "struct" or abi_type.kind == "union" or abi_type.kind == "array") and not pointer_is_null(value) then
+        return ffi.global(pointer_value(value), abi_type)
+    end
+    if abi_type.kind == "pointer" and abi_type.to and abi_type.to.kind == "function" then
+        if pointer_is_null(value) then return nil end
+        return create_bound_callable(pointer_value(value), abi_type.to, "ffi.callback")
+    end
+    return value
+end
+
+local function ensure_callback_return_storage(abi_type, state)
+    if state.ret_scratch == nil then
+        state.ret_scratch = memory.alloc(abi_type_size(abi_type))
+    end
+    return state.ret_scratch
+end
+
+local function prepare_callback_return_value(value, abi_type_value, state)
+    local abi_type = normalize_abi_type(abi_type_value)
+    if abi_type.kind == "struct" or abi_type.kind == "union" or abi_type.kind == "array" then
+        local scratch = ensure_callback_return_storage(abi_type, state)
+        copy_abi_value_to_memory(scratch, abi_type, value)
+        return scratch
+    end
+    if abi_type.kind == "pointer" and abi_type.to and abi_type.to.kind == "function" and is_pointer_like(value, abi_type) then
+        return pointer_value(value)
+    end
+    return value
+end
+
+local function create_callback_adapter(desc, fn, state)
+    if not desc.type or desc.type.kind ~= "function" then
+        return fn
+    end
+    return function(...)
+        local raw_args = { ... }
+        local args = {}
+        for i = 1, #raw_args do
+            if i <= #desc.type.args then
+                args[i] = wrap_callback_argument(raw_args[i], desc.type.args[i])
+            else
+                args[i] = raw_args[i]
+            end
+        end
+        return prepare_callback_return_value(fn(table.unpack(args, 1, #args)), desc.type.ret, state)
+    end
+end
+
+copy_schema_value_to_memory = function(ptr, schema_meta, value, total_size)
+    local copy_size = schema_meta.has_flexible_array and total_size ~= nil and to_non_negative_int(total_size, "total_size") or schema_meta.size
+    if is_pointer_like(value) then
+        native.copy(ptr, pointer_value(value), copy_size)
+        return
+    end
+    if type(value) ~= "table" then
+        error("expected table value for struct/union assignment", 3)
+    end
+    for i = 1, #schema_meta.fields do
+        local field = schema_meta.fields[i]
+        local field_value = rawget(value, field.name)
+        if field_value ~= nil then
+            write_schema_field_value(ptr + field.offset, field, field_value, total_size)
+        end
+    end
+end
+
+create_pointer_reference = function(ptr, field)
+    local target_ptr = ptr
+    local target_schema = field.to_schema and compile_schema(field.to_schema) or nil
+    local target_type = field.to_type and normalize_abi_type(field.to_type) or nil
+    local is_null = target_ptr == 0 or target_ptr == nil
+
+    local function deref(options)
+        options = options or {}
+        if is_null then return nil end
+        if target_schema then return create_view(target_ptr, target_schema, options.total_size) end
+        if target_type then
+            if target_type.kind == "function" then return create_bound_callable(target_ptr, target_type, "memory.view") end
+            if target_type.kind == "struct" or target_type.kind == "union" or target_type.kind == "array" then
+                return ffi.global(target_ptr, target_type)
+            end
+            return read_abi_value(target_ptr, target_type)
+        end
+        return target_ptr
+    end
+
+    local function write(value)
+        if is_null then
+            error("pointer field " .. tostring(field.name) .. " is null", 2)
+        end
+        if target_schema then
+            copy_schema_value_to_memory(target_ptr, target_schema, value)
+            return
+        end
+        if target_type then
+            if target_type.kind == "struct" or target_type.kind == "union" or target_type.kind == "array" then
+                copy_abi_value_to_memory(target_ptr, target_type, value)
+                return
+            end
+            write_abi_value(target_ptr, target_type, is_pointer_like(value, target_type) and pointer_value(value) or value)
+            return
+        end
+        native.writeptr(target_ptr, pointer_value(value))
+    end
+
+    return {
+        ptr = target_ptr,
+        is_null = is_null,
+        isNull = is_null,
+        deref = deref,
+        read = deref,
+        view = deref,
+        write = write,
+    }
+end
+
+read_schema_field_value = function(addr, field, total_size)
+    if field.kind == "prim" then
+        return read_primitive(addr, field.type)
+    elseif field.kind == "enum" then
+        return read_abi_value(addr, field.abi_type)
+    elseif field.kind == "pointer" then
+        local value = native.readptr(addr)
+        if field.to_schema or field.to_type then
+            return create_pointer_reference(value, field)
+        end
+        return value
+    elseif field.kind == "fnptr" then
+        local value = native.readptr(addr)
+        if pointer_is_null(value) then return nil end
+        return create_bound_callable(value, field.fn_type, "memory.view")
+    elseif field.kind == "array" then
+        return read_array(addr, field.type, field.count)
+    elseif field.kind == "flex_array" then
+        return read_array(addr, field.type, schema_field_count(field, total_size))
+    elseif field.kind == "struct" then
+        return create_view(addr, field.schema, nested_schema_total_size(field, total_size))
+    end
+    return nil
+end
+
+write_schema_field_value = function(addr, field, value, total_size)
+    if field.kind == "prim" then
+        write_primitive(addr, field.type, value)
+        return
+    elseif field.kind == "enum" then
+        write_abi_value(addr, field.abi_type, value)
+        return
+    elseif field.kind == "pointer" or field.kind == "fnptr" then
+        native.writeptr(addr, pointer_value(value))
+        return
+    elseif field.kind == "array" or field.kind == "flex_array" then
+        local count = schema_field_count(field, total_size)
+        local elem_size = field.elem_size or TYPE_INFO[field.type].size
+        if is_pointer_like(value) then
+            native.copy(addr, pointer_value(value), count * elem_size)
+            return
+        end
+        if type(value) ~= "table" then
+            error("field " .. tostring(field.name) .. " expects an array value", 2)
+        end
+        local value_count = #value
+        if value_count > count then
+            error("field " .. tostring(field.name) .. " expects at most " .. tostring(count) .. " elements", 2)
+        end
+        for i = 1, count do
+            write_primitive(addr + (i - 1) * elem_size, field.type, value[i] or 0)
+        end
+        return
+    elseif field.kind == "struct" then
+        copy_schema_value_to_memory(addr, field.schema, value, nested_schema_total_size(field, total_size))
+        return
+    end
+    error("field " .. tostring(field.name) .. " is not directly assignable", 2)
+end
+
 local ffi_type = {}
 
 function ffi_type.primitive(name)
@@ -827,7 +1299,7 @@ for _, name in ipairs({ "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "
     end
 end
 
-local ffi = {
+ffi = {
     flags = native.dlopen_flags,
     type = ffi_type,
 }
@@ -855,16 +1327,7 @@ function ffi.describe(sig)
 end
 
 function ffi.bind(ptr, descriptor)
-    local desc = ensure_ffi_descriptor(descriptor, "ffi.bind")
-    if desc.handle == nil then
-        error("ffi.bind descriptor is not natively callable yet: " .. tostring(desc.sig), 2)
-    end
-    local handle = native.bind(ptr, desc.handle)
-    return setmetatable({ handle = handle, sig = tostring(desc.sig or ""), descriptor = desc }, {
-        __call = function(self, ...)
-            return native.call_bound(self.handle, { ... })
-        end,
-    })
+    return create_bound_callable(ptr, descriptor, "ffi.bind")
 end
 
 function ffi.callback(descriptor, fn)
@@ -872,9 +1335,11 @@ function ffi.callback(descriptor, fn)
     if desc.handle == nil then
         error("ffi.callback descriptor is not natively callable yet: " .. tostring(desc.sig), 2)
     end
-    local result = native.callback(desc.handle, fn)
+    local callback_state = { ret_scratch = nil }
+    local result = native.callback(desc.handle, create_callback_adapter(desc, fn, callback_state))
     if type(result) == "table" then
         result.sig = tostring(desc.sig or "")
+        result.descriptor = desc
     end
     return result
 end
@@ -898,7 +1363,7 @@ function ffi.dlerror()
     return native.dlerror()
 end
 
-local memory = {
+memory = {
     alloc = native.alloc,
     free = native.free,
     realloc = native.realloc,
@@ -963,8 +1428,8 @@ function memory.struct_offsetof(schema, field_name)
     return field.offset
 end
 
-function memory.view(ptr, schema)
-    return create_view(ptr, compile_schema(schema))
+function memory.view(ptr, schema, total_size)
+    return create_view(ptr, compile_schema(schema), total_size)
 end
 
 function memory.view_array(ptr, schema, count)

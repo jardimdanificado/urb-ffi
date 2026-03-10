@@ -1,12 +1,20 @@
 #include <lua.h>
 #include <lauxlib.h>
 
+#include <ffi.h>
+
 #include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
 
 #define URBC_IMPLEMENTATION
 #include "../../../dist/urbc.h"
@@ -40,6 +48,11 @@ struct CallbackBinding {
     lua_State *L;
     int fn_ref;
     FsigParsed sig;
+#ifdef _WIN32
+    DWORD creator_thread;
+#else
+    pthread_t creator_thread;
+#endif
     CallbackBinding *next;
 };
 
@@ -73,6 +86,16 @@ static int urblua_is_nullish(lua_State *L, int idx)
     return t == LUA_TNIL || t == LUA_TNONE;
 }
 
+static int urblua_callback_on_creator_thread(const CallbackBinding *binding)
+{
+    if (!binding) return 0;
+#ifdef _WIN32
+    return binding->creator_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(binding->creator_thread, pthread_self());
+#endif
+}
+
 static int urblua_dup_string(lua_State *L, int idx, char **out, char *err, size_t err_cap)
 {
     size_t len = 0;
@@ -95,6 +118,18 @@ static int urblua_dup_string(lua_State *L, int idx, char **out, char *err, size_
     buf[len] = '\0';
     *out = buf;
     return 1;
+}
+
+static char *urblua_strdup(const char *s)
+{
+    size_t n;
+    char *out;
+    if (!s) return NULL;
+    n = strlen(s);
+    out = (char *)malloc(n + 1);
+    if (!out) return NULL;
+    memcpy(out, s, n + 1);
+    return out;
 }
 
 static int urblua_get_bool(lua_State *L, int idx, int *out, char *err, size_t err_cap)
@@ -182,6 +217,439 @@ static int urblua_get_double(lua_State *L, int idx, double *out, char *err, size
         return 0;
     }
     return 1;
+}
+
+static ffi_type *urblua_ffi_type_for_name(const char *name)
+{
+    if (!name) return NULL;
+    if (strcmp(name, "void") == 0) return &ffi_type_void;
+    if (strcmp(name, "i8") == 0 || strcmp(name, "int8") == 0) return &ffi_type_sint8;
+    if (strcmp(name, "u8") == 0 || strcmp(name, "uint8") == 0 || strcmp(name, "byte") == 0) return &ffi_type_uint8;
+    if (strcmp(name, "i16") == 0 || strcmp(name, "int16") == 0) return &ffi_type_sint16;
+    if (strcmp(name, "u16") == 0 || strcmp(name, "uint16") == 0) return &ffi_type_uint16;
+    if (strcmp(name, "i32") == 0 || strcmp(name, "int32") == 0 || strcmp(name, "int") == 0) return &ffi_type_sint32;
+    if (strcmp(name, "u32") == 0 || strcmp(name, "uint32") == 0 || strcmp(name, "uint") == 0) return &ffi_type_uint32;
+    if (strcmp(name, "i64") == 0 || strcmp(name, "int64") == 0 || strcmp(name, "long") == 0) return &ffi_type_sint64;
+    if (strcmp(name, "u64") == 0 || strcmp(name, "uint64") == 0 || strcmp(name, "ulong") == 0) return &ffi_type_uint64;
+    if (strcmp(name, "f32") == 0 || strcmp(name, "float32") == 0 || strcmp(name, "float") == 0) return &ffi_type_float;
+    if (strcmp(name, "f64") == 0 || strcmp(name, "float64") == 0 || strcmp(name, "double") == 0) return &ffi_type_double;
+    if (strcmp(name, "bool") == 0) return &ffi_type_uint8;
+    if (strcmp(name, "pointer") == 0 || strcmp(name, "ptr") == 0) return &ffi_type_pointer;
+    if (strcmp(name, "cstring") == 0 || strcmp(name, "string") == 0) return &ffi_type_pointer;
+    return NULL;
+}
+
+static int urblua_layout_is_pointer_marker(lua_State *L, int idx)
+{
+    int is_ptr = 0;
+    idx = lua_absindex(L, idx);
+    if (lua_type(L, idx) != LUA_TTABLE) return 0;
+    lua_getfield(L, idx, "__pointer");
+    if (!lua_isnil(L, -1) && (!lua_isboolean(L, -1) || lua_toboolean(L, -1))) {
+        is_ptr = 1;
+    }
+    lua_pop(L, 1);
+    return is_ptr;
+}
+
+static int urblua_layout_is_array(lua_State *L, int idx, uint64_t *count_out,
+                                  char *err, size_t err_cap)
+{
+    uint64_t count = 0;
+    int is_array = 0;
+    idx = lua_absindex(L, idx);
+    if (lua_type(L, idx) != LUA_TTABLE) return 0;
+    lua_rawgeti(L, idx, 1);
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        return 0;
+    }
+    lua_pop(L, 1);
+    lua_rawgeti(L, idx, 2);
+    if (!urblua_get_uint64(L, -1, &count, err, err_cap)) {
+        lua_pop(L, 1);
+        return 0;
+    }
+    lua_pop(L, 1);
+    if (count == 0) {
+        snprintf(err, err_cap, "array layout count must be > 0");
+        return 0;
+    }
+    if (count_out) *count_out = count;
+    is_array = 1;
+    return is_array;
+}
+
+static int urblua_layout_needs_tag(lua_State *L, int idx, char *err, size_t err_cap)
+{
+    uint64_t count = 0;
+    idx = lua_absindex(L, idx);
+    if (urblua_is_nullish(L, idx)) return 0;
+    if (lua_type(L, idx) != LUA_TTABLE) return 0;
+    if (urblua_layout_is_pointer_marker(L, idx)) return 0;
+    if (urblua_layout_is_array(L, idx, &count, err, err_cap)) return 1;
+    return 1;
+}
+
+static int urblua_count_layout_nodes(lua_State *L, int idx,
+                                     size_t *out_nodes, size_t *out_ptrs,
+                                     char *err, size_t err_cap)
+{
+    int t;
+    uint64_t count = 0;
+    idx = lua_absindex(L, idx);
+    if (!out_nodes || !out_ptrs) return 0;
+    *out_nodes = 0;
+    *out_ptrs = 0;
+    if (urblua_is_nullish(L, idx)) return 1;
+    t = lua_type(L, idx);
+    if (t == LUA_TSTRING) return 1;
+    if (t != LUA_TTABLE) {
+        snprintf(err, err_cap, "unsupported layout type");
+        return 0;
+    }
+    if (urblua_layout_is_pointer_marker(L, idx)) return 1;
+
+    if (urblua_layout_is_array(L, idx, &count, err, err_cap)) {
+        size_t child_nodes = 0;
+        size_t child_ptrs = 0;
+        lua_rawgeti(L, idx, 1);
+        if (!urblua_count_layout_nodes(L, -1, &child_nodes, &child_ptrs, err, err_cap)) {
+            lua_pop(L, 1);
+            return 0;
+        }
+        lua_pop(L, 1);
+        *out_nodes = 1 + child_nodes;
+        *out_ptrs = (size_t)(count + 1) + child_ptrs;
+        return 1;
+    }
+
+    lua_getfield(L, idx, "__fields");
+    if (lua_type(L, -1) == LUA_TTABLE && lua_rawlen(L, -1) > 0) {
+        size_t total_nodes = 0;
+        size_t total_ptrs = 0;
+        size_t field_count = 0;
+        lua_Integer i;
+        lua_Integer n = (lua_Integer)lua_rawlen(L, -1);
+        for (i = 1; i <= n; i++) {
+            size_t child_nodes = 0;
+            size_t child_ptrs = 0;
+            const char *fname;
+            lua_rawgeti(L, -1, i);
+            fname = lua_tostring(L, -1);
+            if (!fname || (fname[0] == '_' && fname[1] == '_')) {
+                lua_pop(L, 1);
+                continue;
+            }
+            lua_getfield(L, idx, fname);
+            if (!urblua_count_layout_nodes(L, -1, &child_nodes, &child_ptrs, err, err_cap)) {
+                lua_pop(L, 2);
+                return 0;
+            }
+            lua_pop(L, 1);
+            lua_pop(L, 1);
+            field_count++;
+            total_nodes += child_nodes;
+            total_ptrs += child_ptrs;
+        }
+        lua_pop(L, 1);
+        *out_nodes = 1 + total_nodes;
+        *out_ptrs = (size_t)(field_count + 1) + total_ptrs;
+        return 1;
+    }
+    lua_pop(L, 1);
+
+    {
+        size_t total_nodes = 0;
+        size_t total_ptrs = 0;
+        size_t field_count = 0;
+        lua_pushnil(L);
+        while (lua_next(L, idx) != 0) {
+            size_t child_nodes = 0;
+            size_t child_ptrs = 0;
+            const char *k = lua_tostring(L, -2);
+            if (!k || (k[0] == '_' && k[1] == '_')) {
+                lua_pop(L, 1);
+                continue;
+            }
+            if (!urblua_count_layout_nodes(L, -1, &child_nodes, &child_ptrs, err, err_cap)) {
+                lua_pop(L, 2);
+                return 0;
+            }
+            field_count++;
+            total_nodes += child_nodes;
+            total_ptrs += child_ptrs;
+            lua_pop(L, 1);
+        }
+        *out_nodes = 1 + total_nodes;
+        *out_ptrs = (size_t)(field_count + 1) + total_ptrs;
+    }
+    return 1;
+}
+
+typedef struct UrbluaBuildCtx {
+    lua_State *L;
+    ffi_type *nodes_base;
+    ffi_type **ptr_pool;
+    size_t nodes_cap;
+    size_t next_node;
+    size_t next_ptr;
+    char *err;
+    size_t err_cap;
+} UrbluaBuildCtx;
+
+static ffi_type *urblua_build_node(UrbluaBuildCtx *ctx, int idx)
+{
+    lua_State *L = ctx->L;
+    int t;
+    uint64_t count = 0;
+    idx = lua_absindex(L, idx);
+    t = lua_type(L, idx);
+    if (t == LUA_TSTRING) {
+        const char *name = lua_tostring(L, idx);
+        ffi_type *ft = urblua_ffi_type_for_name(name);
+        if (!ft) snprintf(ctx->err, ctx->err_cap, "unknown primitive layout: %s", name ? name : "<nil>");
+        return ft;
+    }
+    if (t != LUA_TTABLE) {
+        snprintf(ctx->err, ctx->err_cap, "invalid layout node");
+        return NULL;
+    }
+    if (urblua_layout_is_pointer_marker(L, idx)) {
+        return &ffi_type_pointer;
+    }
+
+    if (urblua_layout_is_array(L, idx, &count, ctx->err, ctx->err_cap)) {
+        ffi_type *node;
+        size_t slot;
+        size_t i;
+        if (ctx->next_node >= ctx->nodes_cap) {
+            snprintf(ctx->err, ctx->err_cap, "internal builder overflow");
+            return NULL;
+        }
+        node = &ctx->nodes_base[ctx->next_node++];
+        slot = ctx->next_ptr;
+        ctx->next_ptr += (size_t)count + 1;
+        lua_rawgeti(L, idx, 1);
+        for (i = 0; i < (size_t)count; i++) {
+            ffi_type *child = urblua_build_node(ctx, -1);
+            if (!child) {
+                lua_pop(L, 1);
+                return NULL;
+            }
+            ctx->ptr_pool[slot + i] = child;
+        }
+        lua_pop(L, 1);
+        ctx->ptr_pool[slot + (size_t)count] = NULL;
+        node->type = FFI_TYPE_STRUCT;
+        node->elements = &ctx->ptr_pool[slot];
+        return node;
+    }
+
+    lua_getfield(L, idx, "__fields");
+    if (lua_type(L, -1) == LUA_TTABLE && lua_rawlen(L, -1) > 0) {
+        ffi_type *node;
+        size_t field_count = 0;
+        size_t slot;
+        size_t out_idx = 0;
+        lua_Integer i;
+        lua_Integer n = (lua_Integer)lua_rawlen(L, -1);
+        for (i = 1; i <= n; i++) {
+            const char *fname;
+            lua_rawgeti(L, -1, i);
+            fname = lua_tostring(L, -1);
+            lua_pop(L, 1);
+            if (!fname || (fname[0] == '_' && fname[1] == '_')) continue;
+            field_count++;
+        }
+        if (ctx->next_node >= ctx->nodes_cap) {
+            lua_pop(L, 1);
+            snprintf(ctx->err, ctx->err_cap, "internal builder overflow");
+            return NULL;
+        }
+        node = &ctx->nodes_base[ctx->next_node++];
+        slot = ctx->next_ptr;
+        ctx->next_ptr += field_count + 1;
+        for (i = 1; i <= n; i++) {
+            const char *fname;
+            ffi_type *child;
+            lua_rawgeti(L, -1, i);
+            fname = lua_tostring(L, -1);
+            lua_pop(L, 1);
+            if (!fname || (fname[0] == '_' && fname[1] == '_')) continue;
+            lua_getfield(L, idx, fname);
+            child = urblua_build_node(ctx, -1);
+            lua_pop(L, 1);
+            if (!child) {
+                lua_pop(L, 1);
+                return NULL;
+            }
+            ctx->ptr_pool[slot + out_idx++] = child;
+        }
+        ctx->ptr_pool[slot + out_idx] = NULL;
+        node->type = FFI_TYPE_STRUCT;
+        node->elements = &ctx->ptr_pool[slot];
+        lua_pop(L, 1);
+        return node;
+    }
+    lua_pop(L, 1);
+
+    {
+        ffi_type *node;
+        size_t field_count = 0;
+        size_t slot;
+        size_t out_idx = 0;
+        lua_pushnil(L);
+        while (lua_next(L, idx) != 0) {
+            const char *k = lua_tostring(L, -2);
+            if (k && !(k[0] == '_' && k[1] == '_')) field_count++;
+            lua_pop(L, 1);
+        }
+        if (ctx->next_node >= ctx->nodes_cap) {
+            snprintf(ctx->err, ctx->err_cap, "internal builder overflow");
+            return NULL;
+        }
+        node = &ctx->nodes_base[ctx->next_node++];
+        slot = ctx->next_ptr;
+        ctx->next_ptr += field_count + 1;
+        lua_pushnil(L);
+        while (lua_next(L, idx) != 0) {
+            const char *k = lua_tostring(L, -2);
+            ffi_type *child;
+            if (!k || (k[0] == '_' && k[1] == '_')) {
+                lua_pop(L, 1);
+                continue;
+            }
+            child = urblua_build_node(ctx, -1);
+            if (!child) {
+                lua_pop(L, 2);
+                return NULL;
+            }
+            ctx->ptr_pool[slot + out_idx++] = child;
+            lua_pop(L, 1);
+        }
+        ctx->ptr_pool[slot + out_idx] = NULL;
+        node->type = FFI_TYPE_STRUCT;
+        node->elements = &ctx->ptr_pool[slot];
+        return node;
+    }
+}
+
+static ffi_type *urblua_build_layout_to_ffi(lua_State *L, int idx,
+                                            void **owner_out,
+                                            char *err, size_t err_cap)
+{
+    size_t nodes = 0;
+    size_t ptrs = 0;
+    int t;
+    *owner_out = NULL;
+    idx = lua_absindex(L, idx);
+    if (!urblua_count_layout_nodes(L, idx, &nodes, &ptrs, err, err_cap)) return NULL;
+    if (nodes == 0 && ptrs == 0) {
+        t = lua_type(L, idx);
+        if (t == LUA_TSTRING) {
+            const char *name = lua_tostring(L, idx);
+            ffi_type *ft = urblua_ffi_type_for_name(name);
+            if (!ft) {
+                snprintf(err, err_cap, "unknown primitive layout");
+                return NULL;
+            }
+            return ft;
+        }
+        if (t == LUA_TTABLE && urblua_layout_is_pointer_marker(L, idx)) {
+            return &ffi_type_pointer;
+        }
+        snprintf(err, err_cap, "unsupported simple layout");
+        return NULL;
+    }
+
+    {
+        size_t align = sizeof(void *);
+        size_t nodes_sz = nodes * sizeof(ffi_type);
+        size_t pad = (align - (nodes_sz % align)) % align;
+        size_t ptrs_sz = ptrs * sizeof(ffi_type *);
+        size_t total = nodes_sz + pad + ptrs_sz;
+        void *mem = calloc(1, total);
+        ffi_type *root;
+        UrbluaBuildCtx ctx;
+        if (!mem) {
+            snprintf(err, err_cap, "out of memory");
+            return NULL;
+        }
+        ctx.L = L;
+        ctx.nodes_base = (ffi_type *)mem;
+        ctx.ptr_pool = (ffi_type **)((char *)mem + nodes_sz + pad);
+        ctx.nodes_cap = nodes;
+        ctx.next_node = 0;
+        ctx.next_ptr = 0;
+        ctx.err = err;
+        ctx.err_cap = err_cap;
+
+        root = urblua_build_node(&ctx, idx);
+        if (!root) {
+            free(mem);
+            return NULL;
+        }
+        *owner_out = mem;
+        return root;
+    }
+}
+
+static char *urblua_leaf_from_abi_type(lua_State *L, int idx, char *err, size_t err_cap)
+{
+    int t;
+    idx = lua_absindex(L, idx);
+    t = lua_type(L, idx);
+    if (t == LUA_TSTRING) {
+        size_t len = 0;
+        const char *s = lua_tolstring(L, idx, &len);
+        char *out = (char *)malloc(len + 1);
+        if (!out) {
+            snprintf(err, err_cap, "out of memory");
+            return NULL;
+        }
+        memcpy(out, s, len);
+        out[len] = '\0';
+        return out;
+    }
+    if (t != LUA_TTABLE) {
+        snprintf(err, err_cap, "ABI type must be table or string");
+        return NULL;
+    }
+
+    lua_getfield(L, idx, "kind");
+    if (!lua_isstring(L, -1)) {
+        lua_pop(L, 1);
+        snprintf(err, err_cap, "ABI type missing kind");
+        return NULL;
+    }
+    {
+        const char *kind = lua_tostring(L, -1);
+        char *out = NULL;
+        lua_pop(L, 1);
+        if (strcmp(kind, "void") == 0) return urblua_strdup("void");
+        if (strcmp(kind, "primitive") == 0) {
+            lua_getfield(L, idx, "name");
+            if (!lua_isstring(L, -1)) {
+                lua_pop(L, 1);
+                snprintf(err, err_cap, "primitive ABI missing name");
+                return NULL;
+            }
+            out = urblua_strdup(lua_tostring(L, -1));
+            lua_pop(L, 1);
+            if (!out) snprintf(err, err_cap, "out of memory");
+            return out;
+        }
+        if (strcmp(kind, "cstring") == 0) return urblua_strdup("cstring");
+        if (strcmp(kind, "pointer") == 0) return urblua_strdup("pointer");
+        if (strcmp(kind, "enum") == 0) {
+            lua_getfield(L, idx, "underlying");
+            out = urblua_leaf_from_abi_type(L, -1, err, err_cap);
+            lua_pop(L, 1);
+            return out;
+        }
+        return urblua_strdup("pointer");
+    }
 }
 
 static int urblua_get_pointer_depth(lua_State *L, int idx, uintptr_t *out, int depth,
@@ -484,6 +952,10 @@ static Value urblua_lua_callback(UrbcRuntime *rt, int argc, const Value *argv, v
         urbc_runtime_fail(rt, "ffi.callback: missing Lua callback binding");
         return out;
     }
+    if (!urblua_callback_on_creator_thread(binding)) {
+        urbc_runtime_fail(rt, "ffi.callback: Lua callbacks must run on the creator thread");
+        return out;
+    }
 
     top = lua_gettop(L);
     lua_rawgeti(L, LUA_REGISTRYINDEX, binding->fn_ref);
@@ -656,6 +1128,284 @@ static int urblua_describe(lua_State *L)
     return 1;
 }
 
+static int urblua_describe_descriptor(lua_State *L)
+{
+    char err[URBC_ERROR_CAP];
+    lua_Integer argc_len = 0;
+    LuaDescriptorHandle *wrap;
+    char *ret_leaf = NULL;
+    char *name = NULL;
+    char *ret_tag = NULL;
+    char **arg_leaves = NULL;
+    char **arg_tags = NULL;
+    char *sig = NULL;
+    UrbcFfiDescriptor *descriptor = NULL;
+    int type_idx;
+    int layouts_idx = 0;
+    int have_layouts = 0;
+    int i;
+    static unsigned int layout_seq = 1;
+
+    if (lua_type(L, 1) != LUA_TTABLE) {
+        return urblua_error(L, "describe_descriptor expects a descriptor table");
+    }
+
+    lua_getfield(L, 1, "type");
+    if (lua_type(L, -1) != LUA_TTABLE) {
+        lua_pop(L, 1);
+        return urblua_error(L, "descriptor missing type");
+    }
+    type_idx = lua_absindex(L, -1);
+
+    lua_getfield(L, type_idx, "kind");
+    if (!lua_isstring(L, -1) || strcmp(lua_tostring(L, -1), "function") != 0) {
+        lua_pop(L, 2);
+        return urblua_error(L, "describe_descriptor only supports function types");
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, type_idx, "name");
+    if (lua_isstring(L, -1)) {
+        name = urblua_strdup(lua_tostring(L, -1));
+    }
+    lua_pop(L, 1);
+    if (!name) {
+        name = urblua_strdup("fn");
+        if (!name) {
+            lua_pop(L, 1);
+            return urblua_error(L, "out of memory");
+        }
+    }
+
+    lua_getfield(L, 1, "layouts");
+    if (lua_type(L, -1) == LUA_TTABLE) {
+        have_layouts = 1;
+        layouts_idx = lua_absindex(L, -1);
+    } else {
+        lua_pop(L, 1);
+    }
+
+    lua_getfield(L, type_idx, "ret");
+    ret_leaf = urblua_leaf_from_abi_type(L, -1, err, sizeof(err));
+    if (!ret_leaf) {
+        lua_pop(L, 2);
+        free(name);
+        return urblua_error(L, err);
+    }
+    if (have_layouts && strcmp(ret_leaf, "pointer") == 0) {
+        lua_getfield(L, layouts_idx, "ret");
+        if (urblua_layout_needs_tag(L, -1, err, sizeof(err))) {
+            char tbuf[64];
+            char *tagged;
+            snprintf(tbuf, sizeof(tbuf), "urb_layout_%u", layout_seq++);
+            ret_tag = urblua_strdup(tbuf);
+            if (!ret_tag) {
+                lua_pop(L, 3);
+                free(name);
+                free(ret_leaf);
+                return urblua_error(L, "out of memory");
+            }
+            tagged = (char *)malloc(strlen(ret_tag) + 10);
+            if (!tagged) {
+                lua_pop(L, 3);
+                free(name);
+                free(ret_leaf);
+                free(ret_tag);
+                return urblua_error(L, "out of memory");
+            }
+            snprintf(tagged, strlen(ret_tag) + 10, "pointer(%s)", ret_tag);
+            free(ret_leaf);
+            ret_leaf = tagged;
+        }
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, type_idx, "args");
+    if (lua_type(L, -1) != LUA_TTABLE) {
+        lua_pop(L, 2);
+        free(name);
+        free(ret_leaf);
+        free(ret_tag);
+        return urblua_error(L, "function type missing args");
+    }
+    argc_len = (lua_Integer)lua_rawlen(L, -1);
+    if (argc_len > FSIG_MAX_ARGS) {
+        lua_pop(L, 2);
+        free(name);
+        free(ret_leaf);
+        free(ret_tag);
+        return urblua_error(L, "too many function args");
+    }
+    if (argc_len > 0) {
+        arg_leaves = (char **)calloc((size_t)argc_len, sizeof(char *));
+        arg_tags = (char **)calloc((size_t)argc_len, sizeof(char *));
+        if (!arg_leaves || !arg_tags) {
+            lua_pop(L, 2);
+            free(name);
+            free(ret_leaf);
+            free(ret_tag);
+            free(arg_leaves);
+            free(arg_tags);
+            return urblua_error(L, "out of memory");
+        }
+    }
+
+    for (i = 0; i < argc_len; i++) {
+        lua_rawgeti(L, -1, (lua_Integer)i + 1);
+        arg_leaves[i] = urblua_leaf_from_abi_type(L, -1, err, sizeof(err));
+        lua_pop(L, 1);
+        if (!arg_leaves[i]) {
+            goto fail;
+        }
+        if (have_layouts && strcmp(arg_leaves[i], "pointer") == 0) {
+            lua_getfield(L, layouts_idx, "args");
+            if (lua_type(L, -1) == LUA_TTABLE) {
+                lua_rawgeti(L, -1, (lua_Integer)i + 1);
+                if (urblua_layout_needs_tag(L, -1, err, sizeof(err))) {
+                    char tbuf[64];
+                    char *tagged;
+                    snprintf(tbuf, sizeof(tbuf), "urb_layout_%u", layout_seq++);
+                    arg_tags[i] = urblua_strdup(tbuf);
+                    if (!arg_tags[i]) {
+                        lua_pop(L, 2);
+                        strcpy(err, "out of memory");
+                        goto fail;
+                    }
+                    tagged = (char *)malloc(strlen(arg_tags[i]) + 10);
+                    if (!tagged) {
+                        lua_pop(L, 2);
+                        strcpy(err, "out of memory");
+                        goto fail;
+                    }
+                    snprintf(tagged, strlen(arg_tags[i]) + 10, "pointer(%s)", arg_tags[i]);
+                    free(arg_leaves[i]);
+                    arg_leaves[i] = tagged;
+                }
+                lua_pop(L, 1);
+            }
+            lua_pop(L, 1);
+        }
+    }
+
+    lua_getfield(L, type_idx, "varargs");
+    {
+        int varargs = lua_toboolean(L, -1) ? 1 : 0;
+        size_t total_len = strlen(ret_leaf) + 1 + strlen(name) + 2 + 1;
+        int j;
+        for (j = 0; j < argc_len; j++) {
+            total_len += strlen(arg_leaves[j]);
+            if (j > 0) total_len += 2;
+        }
+        if (varargs) total_len += (argc_len > 0) ? 5 : 3;
+        sig = (char *)malloc(total_len);
+        if (!sig) {
+            lua_pop(L, 1);
+            strcpy(err, "out of memory");
+            goto fail;
+        }
+        sig[0] = '\0';
+        strcat(sig, ret_leaf);
+        strcat(sig, " ");
+        strcat(sig, name);
+        strcat(sig, "(");
+        for (j = 0; j < argc_len; j++) {
+            if (j > 0) strcat(sig, ", ");
+            strcat(sig, arg_leaves[j]);
+        }
+        if (varargs) {
+            if (argc_len > 0) strcat(sig, ", ...");
+            else strcat(sig, "...");
+        }
+        strcat(sig, ")");
+    }
+    lua_pop(L, 1);
+
+    if (urbc_ffi_describe(sig, &descriptor, err, sizeof(err)) != URBC_OK) {
+        goto fail;
+    }
+
+    if (ret_tag && have_layouts) {
+        void *owner = NULL;
+        ffi_type *ft;
+        lua_getfield(L, layouts_idx, "ret");
+        ft = urblua_build_layout_to_ffi(L, -1, &owner, err, sizeof(err));
+        lua_pop(L, 1);
+        if (!ft) {
+            if (owner) free(owner);
+            goto fail;
+        }
+        if (urbc_ffi_descriptor_attach_ffi_type(descriptor, ret_tag, ft, 1, owner, err, sizeof(err)) != URBC_OK) {
+            if (owner) free(owner);
+            goto fail;
+        }
+    }
+
+    if (arg_tags && have_layouts) {
+        lua_getfield(L, layouts_idx, "args");
+        for (i = 0; i < argc_len; i++) {
+            void *owner = NULL;
+            ffi_type *ft;
+            if (!arg_tags[i]) continue;
+            if (lua_type(L, -1) != LUA_TTABLE) {
+                strcpy(err, "descriptor layouts.args must be a table");
+                lua_pop(L, 1);
+                goto fail;
+            }
+            lua_rawgeti(L, -1, (lua_Integer)i + 1);
+            ft = urblua_build_layout_to_ffi(L, -1, &owner, err, sizeof(err));
+            lua_pop(L, 1);
+            if (!ft) {
+                if (owner) free(owner);
+                lua_pop(L, 1);
+                goto fail;
+            }
+            if (urbc_ffi_descriptor_attach_ffi_type(descriptor, arg_tags[i], ft, 1, owner, err, sizeof(err)) != URBC_OK) {
+                if (owner) free(owner);
+                lua_pop(L, 1);
+                goto fail;
+            }
+        }
+        lua_pop(L, 1);
+    }
+
+    wrap = (LuaDescriptorHandle *)lua_newuserdatauv(L, sizeof(*wrap), 0);
+    memset(wrap, 0, sizeof(*wrap));
+    wrap->state = urblua_state(L);
+    wrap->descriptor = descriptor;
+    luaL_setmetatable(L, URB_LUA_DESC_MT);
+
+    free(name);
+    free(ret_leaf);
+    free(ret_tag);
+    free(sig);
+    if (arg_leaves) {
+        for (i = 0; i < argc_len; i++) free(arg_leaves[i]);
+    }
+    if (arg_tags) {
+        for (i = 0; i < argc_len; i++) free(arg_tags[i]);
+    }
+    free(arg_leaves);
+    free(arg_tags);
+    return 1;
+
+fail:
+    if (descriptor) urbc_ffi_descriptor_release(descriptor);
+    free(name);
+    free(ret_leaf);
+    free(ret_tag);
+    free(sig);
+    if (arg_leaves) {
+        for (i = 0; i < argc_len; i++) free(arg_leaves[i]);
+    }
+    if (arg_tags) {
+        for (i = 0; i < argc_len; i++) free(arg_tags[i]);
+    }
+    free(arg_leaves);
+    free(arg_tags);
+    return urblua_error(L, err[0] ? err : "failed to describe descriptor");
+}
+
 static int urblua_bind(lua_State *L)
 {
     AddonState *state = urblua_state(L);
@@ -764,6 +1514,11 @@ static int urblua_callback(lua_State *L)
         return urblua_error(L, "out of memory");
     }
     binding->L = L;
+#ifdef _WIN32
+    binding->creator_thread = GetCurrentThreadId();
+#else
+    binding->creator_thread = pthread_self();
+#endif
     if (urbc_ffi_descriptor_copy_parsed(desc->descriptor, &binding->sig, err, sizeof(err)) != URBC_OK) {
         free(binding);
         return urblua_error(L, err);
@@ -1129,6 +1884,7 @@ int luaopen_urb_ffi_native(lua_State *L)
     urblua_setfunc(L, -1, -2, "sym", urblua_sym);
     urblua_setfunc(L, -1, -2, "sym_self", urblua_sym_self);
     urblua_setfunc(L, -1, -2, "describe", urblua_describe);
+    urblua_setfunc(L, -1, -2, "describe_descriptor", urblua_describe_descriptor);
     urblua_setfunc(L, -1, -2, "bind", urblua_bind);
     urblua_setfunc(L, -1, -2, "call_bound", urblua_call_bound);
     urblua_setfunc(L, -1, -2, "callback", urblua_callback);

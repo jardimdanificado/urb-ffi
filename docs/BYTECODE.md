@@ -349,6 +349,7 @@ Notes:
 - `ffi.open`, `ffi.sym`, `ffi.sym_self` do not raise runtime failure on lookup/open failure; check `ffi.dlerror`.
 - `ffi.call*` on a `void` function pushes a zeroed `Value`.
 - `ffi.callback` only targets **host bindings**, not bytecode closures.
+- `ffi.callback` is creator-thread only; foreign-thread invocation returns a zero/default result.
 - Variadic callbacks are not supported.
 
 #### `ffi.callv`

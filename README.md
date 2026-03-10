@@ -308,11 +308,22 @@ For variadic arguments, the runtime infers a suitable native type from the host 
 
 Creates a real C-callable function pointer backed by a JavaScript or Lua function.
 
+With rich descriptors from `ffi.type.func(...)`, callback adapters now also:
+
+- expose by-value `struct` / `union` / fixed-array arguments as host-side views
+- accept schema-compatible by-value record/array return values from the host callback
+- expose function-pointer callback arguments as callable bound functions
+
 The returned object contains at least:
 
 - `ptr`: the native function pointer to pass back into C
 
 It also owns internal resources, so **keep the callback object alive for as long as C may call it**.
+
+Current policy/limits:
+
+- callbacks are only supported on the same thread that created them
+- variadic callbacks are still unsupported
 
 Node example:
 
@@ -480,6 +491,10 @@ Supported field forms in Node:
 - primitive: `x: 'i32'`
 - fixed array: `bytes: ['u8', 16]`
 - pointer field: `next: { __pointer: true }`
+- typed pointer field: `next: { type: 'pointer', to: OtherSchema }`
+- enum field: `mode: ffi.type.enum({ Idle: 0, Run: 1 })`
+- function pointer field: `cb: ffi.type.func(ffi.type.i32(), [ffi.type.i32()])`
+- flexible array member: `bytes: { type: 'u8', flexible: true }`
 - nested struct/union: `origin: OtherSchema`
 - top-level or nested union: add `__union: true`
 - explicit struct marker: `__struct: true`
@@ -502,6 +517,10 @@ Supported field forms in Lua:
 - primitive: `{ name = 'x', type = 'i32' }`
 - fixed array: `{ name = 'bytes', type = 'u8', count = 16 }`
 - pointer field: `{ name = 'next', pointer = true }`
+- typed pointer field: `{ name = 'next', type = 'pointer', to = OtherSchema }`
+- enum field: `{ name = 'mode', type = ffi.type.enum({ Idle = 0, Run = 1 }) }`
+- function pointer field: `{ name = 'cb', type = ffi.type.func(ffi.type.i32(), { ffi.type.i32() }) }`
+- flexible array member: `{ name = 'bytes', type = 'u8', flexible = true }`
 - nested struct/union: `{ name = 'origin', schema = OtherSchema }`
 - top-level or nested union: add `__union = true` on the schema table
 
@@ -523,15 +542,18 @@ print(mem.struct_sizeof(Point))
 print(mem.struct_offsetof(Point, 'value'))
 ```
 
-### `memory.view(ptr, schema)`
+### `memory.view(ptr, schema[, totalSize])`
 
 Creates a live host-side view over native memory.
 
 - primitive fields are readable and writable
-- pointer fields are readable and writable
+- typed pointer fields expose `{ ptr, isNull, deref(), read(), view(), write() }`
+- function pointer fields are exposed as callable bound functions
 - nested structs/unions are exposed as nested views
 - fixed arrays are readable as host arrays/tables
-- whole array fields and nested struct fields are **not** assigned as one value; edit their members instead
+- whole nested struct fields can be assigned from plain objects
+- fixed and flexible array fields can be assigned from plain arrays
+- use `totalSize` when the schema ends with a flexible array member
 
 Node example:
 
@@ -558,6 +580,14 @@ console.log(ray.direction.x, ray.direction.y, ray.direction.z);
 
 mem.free(rayPtr);
 ```
+
+Advanced Node example with enum fields, function-pointer fields, typed pointer dereference, and a flexible array member:
+
+- [bindings/node/examples/memory_phase6.js](bindings/node/examples/memory_phase6.js)
+
+Equivalent Lua example:
+
+- [bindings/lua/examples/memory_phase6.lua](bindings/lua/examples/memory_phase6.lua)
 
 ### `memory.viewArray` / `memory.view_array`
 
@@ -729,11 +759,14 @@ local ffi, memory = urb.ffi, urb.memory
 ### Node examples
 
 - [bindings/node/examples/hello.js](bindings/node/examples/hello.js)
+- [bindings/node/examples/manual_types.js](bindings/node/examples/manual_types.js)
 - [bindings/node/examples/memory.js](bindings/node/examples/memory.js)
 - [bindings/node/examples/memory_utils.js](bindings/node/examples/memory_utils.js)
 - [bindings/node/examples/view.js](bindings/node/examples/view.js)
+- [bindings/node/examples/memory_phase6.js](bindings/node/examples/memory_phase6.js)
 - [bindings/node/examples/meta_fields.js](bindings/node/examples/meta_fields.js)
 - [bindings/node/examples/callback.js](bindings/node/examples/callback.js)
+- [bindings/node/examples/byvalue.js](bindings/node/examples/byvalue.js)
 - [bindings/node/examples/sym_self.js](bindings/node/examples/sym_self.js)
 - [bindings/node/examples/smoke.js](bindings/node/examples/smoke.js)
 
@@ -742,11 +775,16 @@ local ffi, memory = urb.ffi, urb.memory
 - [bindings/lua/examples/hello.lua](bindings/lua/examples/hello.lua)
 - [bindings/lua/examples/memory.lua](bindings/lua/examples/memory.lua)
 - [bindings/lua/examples/view.lua](bindings/lua/examples/view.lua)
+- [bindings/lua/examples/memory_phase6.lua](bindings/lua/examples/memory_phase6.lua)
 - [bindings/lua/examples/callback.lua](bindings/lua/examples/callback.lua)
+- [bindings/lua/examples/byvalue.lua](bindings/lua/examples/byvalue.lua)
 - [bindings/lua/examples/sym_self.lua](bindings/lua/examples/sym_self.lua)
 
 ## Notes and limitations
 
+- Rich host descriptors built with `ffi.type.func(...)` support schema-compatible by-value struct/union/array arguments and returns in the Node and Lua bindings.
+- Rich callbacks built with `ffi.type.func(...)` now adapt by-value record/array arguments, schema-compatible complex returns, and function-pointer callback arguments.
+- Host callbacks are creator-thread only; foreign-thread invocation is not supported.
 - By-value recursive schemas are not supported.
 - Recursive data structures can still be represented through pointer fields, but dereferencing is manual: store the address in a pointer field and create a new view from that address when traversing.
 - The Node binding is the npm-focused package surface.

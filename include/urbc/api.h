@@ -3,6 +3,7 @@
 
 #include "urbc/ffi_sig.h"
 #include "urbc/runtime.h"
+#include <ffi.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -45,6 +46,12 @@ void urbc_ffi_descriptor_release(UrbcFfiDescriptor *desc);
 UrbcStatus urbc_ffi_descriptor_copy_parsed(const UrbcFfiDescriptor *desc,
                                            FsigParsed *out_sig,
                                            char *err, size_t err_cap);
+UrbcStatus urbc_ffi_descriptor_attach_ffi_type(UrbcFfiDescriptor *desc,
+                                               const char *tag,
+                                               ffi_type *type,
+                                               int is_byvalue,
+                                               void *owner_ptr,
+                                               char *err, size_t err_cap);
 UrbcStatus urbc_ffi_bind(UrbcRuntime *rt,
                          void *fn_ptr,
                          const char *sig,

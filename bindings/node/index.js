@@ -102,6 +102,10 @@ function normalizeType(type) {
 }
 
 function compileField(name, desc) {
+	if (isAbiType(desc)) {
+		return compileAbiField(name, desc, {});
+	}
+
 	if (typeof desc === 'string') {
 		const type = normalizeType(desc);
 		const info = TYPE_INFO[type];
@@ -126,6 +130,7 @@ function compileField(name, desc) {
 			kind: 'array',
 			type,
 			count,
+			elemSize: info.size,
 			size: info.size * count,
 			align: info.align,
 		};
@@ -135,8 +140,61 @@ function compileField(name, desc) {
 		throw new TypeError(`invalid field descriptor for ${name}`);
 	}
 
+	if (Object.prototype.hasOwnProperty.call(desc, 'type')) {
+		if (isAbiType(desc.type)) {
+			return compileAbiField(name, desc.type, desc);
+		}
+		if (typeof desc.type === 'string') {
+			const normalized = normalizeType(desc.type);
+			const info = TYPE_INFO[normalized];
+			if (desc.flexible) {
+				return {
+					name,
+					kind: 'flex-array',
+					type: normalized,
+					elemSize: info.size,
+					size: 0,
+					align: info.align,
+				};
+			}
+			if (Object.prototype.hasOwnProperty.call(desc, 'count')) {
+				const count = toNonNegativeInt(desc.count, `array count for ${name}`);
+				if (count === 0) {
+					throw new TypeError(`array field ${name} must have count > 0`);
+				}
+				return {
+					name,
+					kind: 'array',
+					type: normalized,
+					count,
+					elemSize: info.size,
+					size: info.size * count,
+					align: info.align,
+				};
+			}
+			if (normalized === 'pointer') {
+				return {
+					name,
+					kind: 'pointer',
+					size: info.size,
+					align: info.align,
+					toSchema: desc.to && !isAbiType(desc.to) ? desc.to : null,
+					toType: desc.to && isAbiType(desc.to) ? desc.to : null,
+				};
+			}
+			return { name, kind: 'prim', type: normalized, size: info.size, align: info.align };
+		}
+	}
+
 	if (desc.__pointer) {
-		return { name, kind: 'pointer', size: PTR_SIZE, align: PTR_SIZE };
+		return {
+			name,
+			kind: 'pointer',
+			size: PTR_SIZE,
+			align: PTR_SIZE,
+			toSchema: desc.to && !isAbiType(desc.to) ? desc.to : null,
+			toType: desc.to && isAbiType(desc.to) ? desc.to : null,
+		};
 	}
 
 	const schema = compileSchema(desc);
@@ -147,6 +205,40 @@ function compileField(name, desc) {
 		size: schema.size,
 		align: schema.align,
 	};
+}
+
+function compileAbiField(name, type, options = {}) {
+	const abiType = normalizeAbiType(type, `field ${name} type`);
+	const toSchema = options.to && !isAbiType(options.to) ? options.to : null;
+	const toType = options.to && isAbiType(options.to) ? options.to : null;
+
+	switch (abiType.kind) {
+	case 'primitive': {
+		const info = TYPE_INFO[abiType.name];
+		return { name, kind: 'prim', type: abiType.name, size: info.size, align: info.align };
+	}
+	case 'enum': {
+		const size = abiTypeSize(abiType);
+		const align = abiTypeSize(abiType.underlying);
+		return { name, kind: 'enum', abiType, size, align };
+	}
+	case 'cstring':
+		return { name, kind: 'pointer', size: PTR_SIZE, align: PTR_SIZE, toType: abiType };
+	case 'function':
+		return { name, kind: 'fnptr', fnType: abiType, size: PTR_SIZE, align: PTR_SIZE };
+	case 'pointer':
+		if (abiType.to && abiType.to.kind === 'function') {
+			return { name, kind: 'fnptr', fnType: abiType.to, size: PTR_SIZE, align: PTR_SIZE };
+		}
+		return { name, kind: 'pointer', size: PTR_SIZE, align: PTR_SIZE, toSchema, toType: toType || abiType.to || null };
+	case 'struct':
+	case 'union': {
+		const schema = compileSchema(abiTypeToLayoutSchema(abiType));
+		return { name, kind: 'struct', schema, abiType, size: schema.size, align: schema.align };
+	}
+	default:
+		throw new TypeError(`unsupported schema ABI field type for ${name}: ${abiType.kind}`);
+	}
 }
 
 function compileSchema(schema) {
@@ -169,6 +261,15 @@ function compileSchema(schema) {
 			if (name.startsWith('__')) continue;
 			fields.push(compileField(name, desc));
 		}
+		const flexibleIndex = fields.findIndex((field) => field.kind === 'flex-array');
+		if (flexibleIndex !== -1) {
+			if (kind === 'union') {
+				throw new TypeError('flexible array members are not allowed in unions');
+			}
+			if (flexibleIndex !== fields.length - 1) {
+				throw new TypeError('flexible array members must be the last field');
+			}
+		}
 
 		let offset = 0;
 		let maxAlign = 1;
@@ -190,6 +291,7 @@ function compileSchema(schema) {
 			kind,
 			align: maxAlign,
 			size: alignUp(kind === 'union' ? maxSize : offset, maxAlign),
+			hasFlexibleArray: flexibleIndex !== -1,
 			fields,
 			fieldMap: new Map(fields.map((field) => [field.name, field])),
 		};
@@ -349,7 +451,29 @@ function createFfiDescriptor(sig, handle, type, nativeSig) {
 function describeFunctionType(fnType) {
 	const sig = abiTypeToString(fnType);
 	const nativeSig = abiFunctionToNativeSignature(fnType);
-	const handle = nativeSig ? native.describe(nativeSig) : null;
+	let handle = null;
+	if (nativeSig) {
+		handle = native.describe(nativeSig);
+	} else {
+		const layouts = { ret: null, args: [] };
+		try {
+			layouts.ret = abiTypeToLayoutSchema(fnType.ret);
+		} catch (e) {
+			layouts.ret = null;
+		}
+		for (let i = 0; i < fnType.args.length; i++) {
+			try {
+				layouts.args[i] = abiTypeToLayoutSchema(fnType.args[i]);
+			} catch (e) {
+				layouts.args[i] = null;
+			}
+		}
+		try {
+			handle = native.describeDescriptor({ type: fnType, layouts });
+		} catch (e) {
+			handle = null;
+		}
+	}
 	return createFfiDescriptor(sig, handle, fnType, nativeSig || sig);
 }
 
@@ -697,31 +821,39 @@ function writeArray(ptr, type, values) {
 	}
 }
 
-function createView(ptr, schemaMeta) {
+function resolveSchemaTotalSize(schemaMeta, totalSize = null) {
+	if (!schemaMeta.hasFlexibleArray) return schemaMeta.size;
+	if (totalSize == null) return schemaMeta.size;
+	const size = toNonNegativeInt(totalSize, 'totalSize');
+	if (size < schemaMeta.size) {
+		throw new TypeError(`totalSize must be at least ${schemaMeta.size}`);
+	}
+	return size;
+}
+
+function nestedSchemaTotalSize(field, totalSize) {
+	if (!field.schema || !field.schema.hasFlexibleArray) return null;
+	if (totalSize == null) return null;
+	const size = toNonNegativeInt(totalSize, 'totalSize');
+	return Math.max(0, size - field.offset);
+}
+
+function createView(ptr, schemaMeta, totalSize = null) {
 	const basePtr = BigInt(ptr);
-	const target = { ptr: basePtr };
+	const byteSize = resolveSchemaTotalSize(schemaMeta, totalSize);
+	const target = { ptr: basePtr, byteSize };
 
 	return new Proxy(target, {
 		get(_, prop) {
 			if (prop === 'ptr') return basePtr;
+			if (prop === 'byteSize') return byteSize;
 			if (typeof prop !== 'string') return undefined;
 
 			const field = schemaMeta.fieldMap.get(prop);
 			if (!field) return undefined;
 
 			const addr = basePtr + BigInt(field.offset);
-			switch (field.kind) {
-			case 'prim':
-				return readPrimitive(addr, field.type);
-			case 'pointer':
-				return native.readptr(addr);
-			case 'array':
-				return readArray(addr, field.type, field.count);
-			case 'struct':
-				return createView(addr, field.schema);
-			default:
-				return undefined;
-			}
+			return readSchemaFieldValue(addr, field, byteSize);
 		},
 		set(_, prop, value) {
 			if (typeof prop !== 'string') return false;
@@ -729,25 +861,17 @@ function createView(ptr, schemaMeta) {
 			if (!field) return false;
 
 			const addr = basePtr + BigInt(field.offset);
-			switch (field.kind) {
-			case 'prim':
-				writePrimitive(addr, field.type, value);
-				return true;
-			case 'pointer':
-				native.writeptr(addr, value);
-				return true;
-			default:
-				throw new TypeError(`field ${prop} is not directly assignable`);
-			}
+			writeSchemaFieldValue(addr, field, value, byteSize);
+			return true;
 		},
 		has(_, prop) {
-			return prop === 'ptr' || schemaMeta.fieldMap.has(prop);
+			return prop === 'ptr' || prop === 'byteSize' || schemaMeta.fieldMap.has(prop);
 		},
 		ownKeys() {
-			return ['ptr', ...schemaMeta.fieldMap.keys()];
+			return ['ptr', 'byteSize', ...schemaMeta.fieldMap.keys()];
 		},
 		getOwnPropertyDescriptor(_, prop) {
-			if (prop === 'ptr') {
+			if (prop === 'ptr' || prop === 'byteSize') {
 				return { enumerable: true, configurable: true };
 			}
 			if (schemaMeta.fieldMap.has(prop)) {
@@ -762,12 +886,14 @@ function createViewArray(ptr, schemaMeta, count) {
 	const basePtr = BigInt(ptr);
 	const size = schemaMeta.size;
 	const length = toNonNegativeInt(count, 'count');
-	const target = { ptr: basePtr, count: length, length };
+	const byteSize = size * length;
+	const target = { ptr: basePtr, count: length, length, byteSize };
 
 	return new Proxy(target, {
 		get(_, prop) {
 			if (prop === 'ptr') return basePtr;
 			if (prop === 'count' || prop === 'length') return length;
+			if (prop === 'byteSize') return byteSize;
 			if (prop === Symbol.iterator) {
 				return function* iterator() {
 					for (let i = 0; i < length; i++) {
@@ -782,16 +908,16 @@ function createViewArray(ptr, schemaMeta, count) {
 			return createView(basePtr + BigInt(index * size), schemaMeta);
 		},
 		has(_, prop) {
-			if (prop === 'ptr' || prop === 'count' || prop === 'length') return true;
+			if (prop === 'ptr' || prop === 'count' || prop === 'length' || prop === 'byteSize') return true;
 			return isArrayIndex(prop) && Number(prop) < length;
 		},
 		ownKeys() {
-			const keys = ['ptr', 'count', 'length'];
+			const keys = ['ptr', 'count', 'length', 'byteSize'];
 			for (let i = 0; i < length; i++) keys.push(String(i));
 			return keys;
 		},
 		getOwnPropertyDescriptor(_, prop) {
-			if (prop === 'ptr' || prop === 'count' || prop === 'length') {
+			if (prop === 'ptr' || prop === 'count' || prop === 'length' || prop === 'byteSize') {
 				return { enumerable: true, configurable: true };
 			}
 			if (isArrayIndex(prop) && Number(prop) < length) {
@@ -800,6 +926,292 @@ function createViewArray(ptr, schemaMeta, count) {
 			return undefined;
 		},
 	});
+}
+
+function abiTypeHasField(type, fieldName) {
+	const abiType = normalizeAbiType(type);
+	return (abiType.kind === 'struct' || abiType.kind === 'union')
+		&& abiType.fields.some((field) => field.name === fieldName);
+}
+
+function isPointerLike(value, expectedType = null) {
+	if (value == null) return false;
+	if (typeof value === 'number' || typeof value === 'bigint' || Buffer.isBuffer(value)) {
+		return true;
+	}
+	if ((typeof value === 'object' || typeof value === 'function') && Object.prototype.hasOwnProperty.call(value, 'ptr')) {
+		return expectedType == null || !abiTypeHasField(expectedType, 'ptr');
+	}
+	return false;
+}
+
+function pointerValue(value) {
+	if ((typeof value === 'object' || typeof value === 'function') && value !== null
+		&& Object.prototype.hasOwnProperty.call(value, 'ptr')) {
+		return value.ptr;
+	}
+	return value;
+}
+
+function pointerIsNull(value) {
+	if (value == null) return true;
+	try {
+		return BigInt(pointerValue(value)) === 0n;
+	} catch {
+		return false;
+	}
+}
+
+function copyAbiValueToMemory(ptr, type, value) {
+	const abiType = normalizeAbiType(type);
+	const basePtr = BigInt(ptr);
+
+	switch (abiType.kind) {
+	case 'primitive':
+	case 'enum':
+	case 'cstring':
+	case 'pointer':
+	case 'function':
+		writeAbiValue(basePtr, abiType, isPointerLike(value, abiType) ? pointerValue(value) : value);
+		return;
+	case 'array': {
+		const totalSize = BigInt(abiTypeSize(abiType));
+		if (isPointerLike(value, abiType)) {
+			native.copy(basePtr, pointerValue(value), totalSize);
+			return;
+		}
+		native.zero(basePtr, totalSize);
+		if (value == null) return;
+		if (!Array.isArray(value) && typeof value !== 'object') {
+			throw new TypeError(`expected array-like value for ${abiTypeToString(abiType)}`);
+		}
+		const stride = abiTypeSize(abiType.element);
+		for (let i = 0; i < abiType.length; i++) {
+			if (!(i in value)) continue;
+			copyAbiValueToMemory(basePtr + BigInt(i * stride), abiType.element, value[i]);
+		}
+		return;
+	}
+	case 'struct':
+	case 'union': {
+		const totalSize = BigInt(abiTypeSize(abiType));
+		if (isPointerLike(value, abiType)) {
+			native.copy(basePtr, pointerValue(value), totalSize);
+			return;
+		}
+		native.zero(basePtr, totalSize);
+		if (value == null) return;
+		if (typeof value !== 'object') {
+			throw new TypeError(`expected object value for ${abiTypeToString(abiType)}`);
+		}
+		for (const field of abiType.fields) {
+			if (!Object.prototype.hasOwnProperty.call(value, field.name)) continue;
+			copyAbiValueToMemory(
+				basePtr + BigInt(ffiType.offsetof(abiType, field.name)),
+				field.type,
+				value[field.name],
+			);
+		}
+		return;
+	}
+	default:
+		throw new TypeError(`unsupported callback ABI type: ${abiType.kind}`);
+	}
+}
+
+function createBoundCallable(ptr, descriptor, context = 'ffi.bind') {
+	const desc = ensureFfiDescriptor(descriptor, context);
+	if (!desc.handle) {
+		throw new TypeError(`${context} descriptor is not natively callable yet: ${desc.sig}`);
+	}
+	const fnPtr = pointerValue(ptr);
+	const handle = native.bind(fnPtr, desc.handle);
+	const fn = (...args) => native.callBound(handle, args);
+	Object.defineProperties(fn, {
+		handle: { value: handle, enumerable: false },
+		ptr: { value: BigInt(fnPtr), enumerable: false },
+		sig: { value: String(desc.sig || ''), enumerable: true },
+		descriptor: { value: desc, enumerable: false },
+	});
+	return fn;
+}
+
+function wrapCallbackArgument(value, type) {
+	const abiType = normalizeAbiType(type);
+	if ((abiType.kind === 'struct' || abiType.kind === 'union' || abiType.kind === 'array') && !pointerIsNull(value)) {
+		return ffi.global(pointerValue(value), abiType);
+	}
+	if (abiType.kind === 'pointer' && abiType.to && abiType.to.kind === 'function') {
+		if (pointerIsNull(value)) return null;
+		return createBoundCallable(pointerValue(value), abiType.to, 'ffi.callback');
+	}
+	return value;
+}
+
+function ensureCallbackReturnStorage(type, state) {
+	if (state.retScratch == null) {
+		state.retScratch = memory.alloc(BigInt(abiTypeSize(type)));
+	}
+	return state.retScratch;
+}
+
+function prepareCallbackReturnValue(value, type, state) {
+	const abiType = normalizeAbiType(type);
+	if (abiType.kind === 'struct' || abiType.kind === 'union' || abiType.kind === 'array') {
+		const scratch = ensureCallbackReturnStorage(abiType, state);
+		copyAbiValueToMemory(scratch, abiType, value);
+		return scratch;
+	}
+	if (abiType.kind === 'pointer' && abiType.to && abiType.to.kind === 'function' && isPointerLike(value, abiType)) {
+		return pointerValue(value);
+	}
+	return value;
+}
+
+function createCallbackAdapter(desc, fn, state) {
+	if (!desc.type || desc.type.kind !== 'function') {
+		return fn;
+	}
+	return (...args) => {
+		const wrappedArgs = args.map((arg, index) => (
+			index < desc.type.args.length ? wrapCallbackArgument(arg, desc.type.args[index]) : arg
+		));
+		return prepareCallbackReturnValue(fn(...wrappedArgs), desc.type.ret, state);
+	};
+}
+
+function schemaFieldCount(field, totalSize) {
+	if (field.kind !== 'flex-array') return field.count;
+	if (totalSize == null) {
+		throw new TypeError(`field ${field.name} requires totalSize for flexible array access`);
+	}
+	const size = toNonNegativeInt(totalSize, 'totalSize');
+	if (size < field.offset) return 0;
+	return Math.floor((size - field.offset) / field.elemSize);
+}
+
+function copySchemaValueToMemory(ptr, schemaMeta, value, totalSize = null) {
+	const basePtr = BigInt(ptr);
+	const copySize = schemaMeta.hasFlexibleArray && totalSize != null ? toNonNegativeInt(totalSize, 'totalSize') : schemaMeta.size;
+	if (isPointerLike(value)) {
+		native.copy(basePtr, pointerValue(value), BigInt(copySize));
+		return;
+	}
+	if (value == null || typeof value !== 'object') {
+		throw new TypeError('expected object value for struct/union assignment');
+	}
+	for (const field of schemaMeta.fields) {
+		if (!Object.prototype.hasOwnProperty.call(value, field.name)) continue;
+		writeSchemaFieldValue(basePtr + BigInt(field.offset), field, value[field.name], totalSize);
+	}
+}
+
+function createPointerReference(ptr, field) {
+	const targetPtr = BigInt(ptr);
+	const targetSchema = field.toSchema ? compileSchema(field.toSchema) : null;
+	const targetType = field.toType ? normalizeAbiType(field.toType) : null;
+	const isNull = targetPtr === 0n;
+	const deref = (options = {}) => {
+		if (isNull) return null;
+		if (targetSchema) return createView(targetPtr, targetSchema, options.totalSize);
+		if (targetType) {
+			if (targetType.kind === 'function') return createBoundCallable(targetPtr, targetType, 'memory.view');
+			if (targetType.kind === 'struct' || targetType.kind === 'union' || targetType.kind === 'array') {
+				return ffi.global(targetPtr, targetType);
+			}
+			return readAbiValue(targetPtr, targetType);
+		}
+		return targetPtr;
+	};
+	const write = (value) => {
+		if (isNull) throw new TypeError(`pointer field ${field.name} is null`);
+		if (targetSchema) {
+			copySchemaValueToMemory(targetPtr, targetSchema, value);
+			return;
+		}
+		if (targetType) {
+			if (targetType.kind === 'struct' || targetType.kind === 'union' || targetType.kind === 'array') {
+				copyAbiValueToMemory(targetPtr, targetType, value);
+				return;
+			}
+			writeAbiValue(targetPtr, targetType, isPointerLike(value, targetType) ? pointerValue(value) : value);
+			return;
+		}
+		native.writeptr(targetPtr, pointerValue(value));
+	};
+	return Object.freeze({
+		ptr: targetPtr,
+		isNull,
+		deref,
+		read: deref,
+		view: deref,
+		write,
+	});
+}
+
+function readSchemaFieldValue(addr, field, totalSize = null) {
+	switch (field.kind) {
+	case 'prim':
+		return readPrimitive(addr, field.type);
+	case 'enum':
+		return readAbiValue(addr, field.abiType);
+	case 'pointer': {
+		const ptr = native.readptr(addr);
+		if (field.toSchema || field.toType) return createPointerReference(ptr, field);
+		return ptr;
+	}
+	case 'fnptr': {
+		const ptr = native.readptr(addr);
+		return pointerIsNull(ptr) ? null : createBoundCallable(ptr, field.fnType, 'memory.view');
+	}
+	case 'array':
+		return readArray(addr, field.type, field.count);
+	case 'flex-array':
+		return readArray(addr, field.type, schemaFieldCount(field, totalSize));
+	case 'struct':
+		return createView(addr, field.schema, nestedSchemaTotalSize(field, totalSize));
+	default:
+		return undefined;
+	}
+}
+
+function writeSchemaFieldValue(addr, field, value, totalSize = null) {
+	switch (field.kind) {
+	case 'prim':
+		writePrimitive(addr, field.type, value);
+		return;
+	case 'enum':
+		writeAbiValue(addr, field.abiType, value);
+		return;
+	case 'pointer':
+	case 'fnptr':
+		native.writeptr(addr, pointerValue(value));
+		return;
+	case 'array':
+	case 'flex-array': {
+		const count = schemaFieldCount(field, totalSize);
+		const elemSize = field.elemSize || TYPE_INFO[field.type].size;
+		if (isPointerLike(value)) {
+			native.copy(addr, pointerValue(value), BigInt(count * elemSize));
+			return;
+		}
+		if (!Array.isArray(value)) {
+			throw new TypeError(`field ${field.name} expects an array value`);
+		}
+		if (value.length > count) {
+			throw new TypeError(`field ${field.name} expects at most ${count} elements`);
+		}
+		for (let i = 0; i < count; i++) {
+			writePrimitive(addr + BigInt(i * elemSize), field.type, value[i] ?? 0);
+		}
+		return;
+	}
+	case 'struct':
+		copySchemaValueToMemory(addr, field.schema, value, nestedSchemaTotalSize(field, totalSize));
+		return;
+	default:
+		throw new TypeError(`field ${field.name} is not directly assignable`);
+	}
 }
 
 const ffi = {
@@ -821,25 +1233,16 @@ const ffi = {
 		return native.symSelf(String(name));
 	},
 	bind(ptr, descriptor) {
-		const desc = ensureFfiDescriptor(descriptor, 'ffi.bind');
-		if (!desc.handle) {
-			throw new TypeError(`ffi.bind descriptor is not natively callable yet: ${desc.sig}`);
-		}
-		const handle = native.bind(ptr, desc.handle);
-		const fn = (...args) => native.callBound(handle, args);
-		Object.defineProperties(fn, {
-			handle: { value: handle, enumerable: false },
-			sig: { value: String(desc.sig || ''), enumerable: true },
-			descriptor: { value: desc, enumerable: false },
-		});
-		return fn;
+		return createBoundCallable(ptr, descriptor, 'ffi.bind');
 	},
 	callback(descriptor, fn) {
 		const desc = ensureFfiDescriptor(descriptor, 'ffi.callback');
 		if (!desc.handle) {
 			throw new TypeError(`ffi.callback descriptor is not natively callable yet: ${desc.sig}`);
 		}
-		const result = native.callback(desc.handle, fn);
+		const callbackState = { retScratch: null };
+		const adaptedFn = createCallbackAdapter(desc, fn, callbackState);
+		const result = native.callback(desc.handle, adaptedFn);
 		if (result && Object.prototype.hasOwnProperty.call(result, 'handle')) {
 			Object.defineProperty(result, 'handle', {
 				value: result.handle,
@@ -853,6 +1256,19 @@ const ffi = {
 				value: String(desc.sig || ''),
 				enumerable: true,
 				writable: false,
+				configurable: false,
+			});
+			Object.defineProperty(result, 'descriptor', {
+				value: desc,
+				enumerable: false,
+				writable: false,
+				configurable: false,
+			});
+			Object.defineProperty(result, 'retScratchPtr', {
+				get() {
+					return callbackState.retScratch;
+				},
+				enumerable: false,
 				configurable: false,
 			});
 		}
@@ -931,8 +1347,8 @@ const memory = {
 		}
 		return field.offset;
 	},
-	view(ptr, schema) {
-		return createView(ptr, compileSchema(schema));
+	view(ptr, schema, totalSize) {
+		return createView(ptr, compileSchema(schema), totalSize);
 	},
 	viewArray(ptr, schema, count) {
 		return createViewArray(ptr, compileSchema(schema), count);

@@ -1,8 +1,7 @@
-/dist/urbc.h
-/dist/urbccli.c
-/dist/node/
-/dist/lua/
-/dist/*.so
+/dist/*
 /bindings/node/dist/
 /bindings/node/build/
 /bindgen/build/
+*.so
+*.o
+*.a

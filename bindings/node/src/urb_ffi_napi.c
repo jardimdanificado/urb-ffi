@@ -7,6 +7,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
+
 #include "urbc.h"
 #include "urbc_internal.h"
 
@@ -49,6 +55,11 @@ struct CallbackBinding {
     napi_env env;
     napi_ref fn_ref;
     FsigParsed sig;
+#ifdef _WIN32
+    DWORD creator_thread;
+#else
+    pthread_t creator_thread;
+#endif
     CallbackBinding *next;
 };
 
@@ -76,6 +87,16 @@ static napi_value urbnapi_undefined(napi_env env)
     napi_value out;
     if (napi_get_undefined(env, &out) != napi_ok) return NULL;
     return out;
+}
+
+static int urbnapi_callback_on_creator_thread(const CallbackBinding *binding)
+{
+    if (!binding) return 0;
+#ifdef _WIN32
+    return binding->creator_thread == GetCurrentThreadId();
+#else
+    return pthread_equal(binding->creator_thread, pthread_self());
+#endif
 }
 
 static AddonState *urbnapi_state(napi_env env)
@@ -155,6 +176,16 @@ static int urbnapi_dup_string(napi_env env, napi_value value, char **out, char *
     }
     *out = buf;
     return 1;
+}
+
+static char *urbnapi_strdup(const char *s)
+{
+    if (!s) return NULL;
+    size_t n = strlen(s);
+    char *r = (char *)malloc(n + 1);
+    if (!r) return NULL;
+    memcpy(r, s, n + 1);
+    return r;
 }
 
 static int urbnapi_get_bool(napi_env env, napi_value value, int *out, char *err, size_t err_cap)
@@ -327,6 +358,224 @@ static int urbnapi_get_double(napi_env env, napi_value value, double *out, char 
         snprintf(err, err_cap, "expected numeric value");
         return 0;
     }
+}
+
+/* Map primitive/layout name strings to libffi ffi_type pointers. */
+static ffi_type *urbnapi_ffi_type_for_name(const char *name)
+{
+    if (!name) return NULL;
+    if (strcmp(name, "void") == 0) return &ffi_type_void;
+    if (strcmp(name, "i8") == 0 || strcmp(name, "int8") == 0) return &ffi_type_sint8;
+    if (strcmp(name, "u8") == 0 || strcmp(name, "uint8") == 0 || strcmp(name, "byte") == 0) return &ffi_type_uint8;
+    if (strcmp(name, "i16") == 0 || strcmp(name, "int16") == 0) return &ffi_type_sint16;
+    if (strcmp(name, "u16") == 0 || strcmp(name, "uint16") == 0) return &ffi_type_uint16;
+    if (strcmp(name, "i32") == 0 || strcmp(name, "int32") == 0 || strcmp(name, "int") == 0) return &ffi_type_sint32;
+    if (strcmp(name, "u32") == 0 || strcmp(name, "uint32") == 0 || strcmp(name, "uint") == 0) return &ffi_type_uint32;
+    if (strcmp(name, "i64") == 0 || strcmp(name, "int64") == 0 || strcmp(name, "long") == 0) return &ffi_type_sint64;
+    if (strcmp(name, "u64") == 0 || strcmp(name, "uint64") == 0 || strcmp(name, "ulong") == 0) return &ffi_type_uint64;
+    if (strcmp(name, "f32") == 0 || strcmp(name, "float32") == 0 || strcmp(name, "float") == 0) return &ffi_type_float;
+    if (strcmp(name, "f64") == 0 || strcmp(name, "float64") == 0 || strcmp(name, "double") == 0) return &ffi_type_double;
+    if (strcmp(name, "bool") == 0) return &ffi_type_uint8;
+    if (strcmp(name, "pointer") == 0 || strcmp(name, "ptr") == 0) return &ffi_type_pointer;
+    if (strcmp(name, "cstring") == 0 || strcmp(name, "string") == 0) return &ffi_type_pointer;
+    return NULL;
+}
+
+/* Count dynamic nodes and element pointer slots required for a layout that
+ * requires building libffi dynamic types (struct/array). */
+static int urbnapi_count_layout_nodes(napi_env env, napi_value layout, size_t *out_nodes, size_t *out_ptrs, char *err, size_t err_cap)
+{
+    napi_valuetype t;
+    if (!out_nodes || !out_ptrs) return 0;
+    *out_nodes = 0; *out_ptrs = 0;
+    if (urbnapi_is_nullish(env, layout)) return 1;
+    if (napi_typeof(env, layout, &t) != napi_ok) {
+        snprintf(err, err_cap, "invalid layout"); return 0;
+    }
+    if (t == napi_string) return 1; /* primitive */
+    /* arrays */
+    bool is_array = false;
+    if (napi_is_array(env, layout, &is_array) == napi_ok && is_array) {
+        uint32_t len = 0;
+        if (napi_get_array_length(env, layout, &len) != napi_ok || len < 2) {
+            snprintf(err, err_cap, "invalid array layout"); return 0;
+        }
+        napi_value elemv; napi_get_element(env, layout, 0, &elemv);
+        napi_value countv; napi_get_element(env, layout, 1, &countv);
+        uint64_t count = 0;
+        if (!urbnapi_get_uint64(env, countv, &count, err, err_cap)) return 0;
+        size_t child_nodes = 0, child_ptrs = 0;
+        if (!urbnapi_count_layout_nodes(env, elemv, &child_nodes, &child_ptrs, err, err_cap)) return 0;
+        *out_nodes = 1 + child_nodes;
+        *out_ptrs = (size_t)(count + 1) + child_ptrs;
+        return 1;
+    }
+
+    /* objects: pointer marker or struct/union */
+    if (t == napi_object) {
+        napi_value ptrv;
+        if (napi_get_named_property(env, layout, "__pointer", &ptrv) == napi_ok && !urbnapi_is_nullish(env, ptrv)) {
+            return 1; /* pointer, no dynamic nodes */
+        }
+        napi_value keys; if (napi_get_property_names(env, layout, &keys) != napi_ok) { snprintf(err, err_cap, "invalid layout object"); return 0; }
+        uint32_t klen = 0; napi_get_array_length(env, keys, &klen);
+        size_t field_count = 0;
+        size_t total_nodes = 0, total_ptrs = 0;
+        for (uint32_t i = 0; i < klen; i++) {
+            napi_value keyv; napi_get_element(env, keys, i, &keyv);
+            char *k = NULL; if (!urbnapi_dup_string(env, keyv, &k, err, err_cap)) return 0;
+            if (k[0] == '_' && k[1] == '_') { free(k); continue; }
+            napi_value fieldv; if (napi_get_named_property(env, layout, k, &fieldv) != napi_ok) { free(k); snprintf(err, err_cap, "failed to read field"); return 0; }
+            free(k);
+            size_t cn = 0, cp = 0;
+            if (!urbnapi_count_layout_nodes(env, fieldv, &cn, &cp, err, err_cap)) return 0;
+            field_count++;
+            total_nodes += cn;
+            total_ptrs += cp;
+        }
+        *out_nodes = 1 + total_nodes;
+        *out_ptrs = (size_t)(field_count + 1) + total_ptrs;
+        return 1;
+    }
+    snprintf(err, err_cap, "unsupported layout type"); return 0;
+}
+
+/* Build a dynamic ffi_type graph for a layout. Returns ffi_type* and sets
+ * *owner_out to a single malloc()'d block that must be free()'d by caller. */
+/* context used when recursively constructing a dynamic ffi_type graph */
+typedef struct {
+    napi_env env;
+    ffi_type *nodes_base;
+    ffi_type **ptr_pool;
+    size_t nodes_cap;
+    size_t ptrs_cap;
+    size_t next_node;
+    size_t next_ptr;
+    char *err;
+    size_t err_cap;
+} UrbnapiBuildCtx;
+
+/* recursive helper for layout builder */
+static ffi_type *urbnapi_build_node(UrbnapiBuildCtx *ctx, napi_value lay)
+{
+    napi_env e = ctx->env;
+    napi_valuetype tv;
+    if (napi_typeof(e, lay, &tv) != napi_ok) return NULL;
+    if (tv == napi_string) {
+        char *s = NULL;
+        if (!urbnapi_dup_string(e, lay, &s, ctx->err, ctx->err_cap)) return NULL;
+        ffi_type *ft = urbnapi_ffi_type_for_name(s);
+        free(s);
+        return ft;
+    }
+    bool is_array = false;
+    if (napi_is_array(e, lay, &is_array) == napi_ok && is_array) {
+        uint32_t alen = 0;
+        napi_get_array_length(e, lay, &alen);
+        napi_value elemv; napi_get_element(e, lay, 0, &elemv);
+        napi_value countv; napi_get_element(e, lay, 1, &countv);
+        uint64_t count = 0;
+        if (!urbnapi_get_uint64(e, countv, &count, ctx->err, ctx->err_cap)) return NULL;
+        if (ctx->next_node >= ctx->nodes_cap) { snprintf(ctx->err, ctx->err_cap, "internal builder overflow"); return NULL; }
+        ffi_type *node = &ctx->nodes_base[ctx->next_node++];
+        size_t slot = ctx->next_ptr; ctx->next_ptr += (size_t)count + 1;
+        for (size_t i = 0; i < (size_t)count; i++) {
+            ffi_type *child = urbnapi_build_node(ctx, elemv);
+            if (!child) return NULL;
+            ctx->ptr_pool[slot + i] = child;
+        }
+        ctx->ptr_pool[slot + (size_t)count] = NULL;
+        node->type = FFI_TYPE_STRUCT;
+        node->elements = &ctx->ptr_pool[slot];
+        return node;
+    }
+    napi_value ptrv;
+    if (napi_get_named_property(e, lay, "__pointer", &ptrv) == napi_ok && !urbnapi_is_nullish(e, ptrv)) {
+        return &ffi_type_pointer;
+    }
+    napi_value keys;
+    if (napi_get_property_names(e, lay, &keys) != napi_ok) { snprintf(ctx->err, ctx->err_cap, "invalid layout object"); return NULL; }
+    uint32_t klen = 0; napi_get_array_length(e, keys, &klen);
+    size_t field_count = 0;
+    for (uint32_t i = 0; i < klen; i++) {
+        napi_value keyv; napi_get_element(e, keys, i, &keyv);
+        char *k = NULL;
+        if (!urbnapi_dup_string(e, keyv, &k, ctx->err, ctx->err_cap)) return NULL;
+        if (k[0] == '_' && k[1] == '_') { free(k); continue; }
+        free(k);
+        field_count++;
+    }
+    if (ctx->next_node >= ctx->nodes_cap) { snprintf(ctx->err, ctx->err_cap, "internal builder overflow"); return NULL; }
+    ffi_type *node = &ctx->nodes_base[ctx->next_node++];
+    size_t slot = ctx->next_ptr; ctx->next_ptr += field_count + 1;
+    size_t idx = 0;
+    for (uint32_t i = 0; i < klen; i++) {
+        napi_value keyv; napi_get_element(e, keys, i, &keyv);
+        char *k = NULL;
+        if (!urbnapi_dup_string(e, keyv, &k, ctx->err, ctx->err_cap)) return NULL;
+        if (k[0] == '_' && k[1] == '_') { free(k); continue; }
+        napi_value fieldv;
+        if (napi_get_named_property(e, lay, k, &fieldv) != napi_ok) { free(k); snprintf(ctx->err, ctx->err_cap, "failed to read field"); return NULL; }
+        free(k);
+        ffi_type *child = urbnapi_build_node(ctx, fieldv);
+        if (!child) return NULL;
+        ctx->ptr_pool[slot + idx] = child;
+        idx++;
+    }
+    ctx->ptr_pool[slot + idx] = NULL;
+    node->type = FFI_TYPE_STRUCT;
+    node->elements = &ctx->ptr_pool[slot];
+    return node;
+}
+
+static ffi_type *urbnapi_build_layout_to_ffi(napi_env env, napi_value layout, void **owner_out, char *err, size_t err_cap)
+{
+    size_t nodes = 0, ptrs = 0;
+    *owner_out = NULL;
+    if (!urbnapi_count_layout_nodes(env, layout, &nodes, &ptrs, err, err_cap)) return NULL;
+    if (nodes == 0 && ptrs == 0) {
+        /* primitive or pointer-only */
+        napi_valuetype t; if (napi_typeof(env, layout, &t) != napi_ok) { snprintf(err, err_cap, "invalid layout"); return NULL; }
+        if (t == napi_string) {
+            char *s = NULL; if (!urbnapi_dup_string(env, layout, &s, err, err_cap)) return NULL;
+            ffi_type *ft = urbnapi_ffi_type_for_name(s);
+            free(s);
+            if (!ft) { snprintf(err, err_cap, "unknown primitive layout"); return NULL; }
+            return ft;
+        }
+        /* object pointer marker */
+        napi_value ptrv; if (napi_get_named_property(env, layout, "__pointer", &ptrv) == napi_ok && !urbnapi_is_nullish(env, ptrv)) {
+            return &ffi_type_pointer;
+        }
+        snprintf(err, err_cap, "unsupported simple layout"); return NULL;
+    }
+
+    size_t align = sizeof(void*);
+    size_t nodes_sz = nodes * sizeof(ffi_type);
+    size_t pad = (align - (nodes_sz % align)) % align;
+    size_t ptrs_sz = ptrs * sizeof(ffi_type*);
+    size_t total = nodes_sz + pad + ptrs_sz;
+    void *mem = calloc(1, total);
+    if (!mem) { snprintf(err, err_cap, "out of memory"); return NULL; }
+    ffi_type *nodes_base = (ffi_type *)mem;
+    ffi_type **ptr_pool = (ffi_type **)((char*)mem + nodes_sz + pad);
+
+
+    UrbnapiBuildCtx ctx;
+    ctx.env = env;
+    ctx.nodes_base = nodes_base;
+    ctx.ptr_pool = ptr_pool;
+    ctx.nodes_cap = nodes;
+    ctx.ptrs_cap = ptrs;
+    ctx.next_node = 0;
+    ctx.next_ptr = 0;
+    ctx.err = err;
+    ctx.err_cap = err_cap;
+
+    ffi_type *root = urbnapi_build_node(&ctx, layout);
+    if (!root) { free(mem); return NULL; }
+    *owner_out = mem;
+    return root;
 }
 
 static int urbnapi_get_pointer_depth(napi_env env, napi_value value, uintptr_t *out,
@@ -653,6 +902,10 @@ static Value urbnapi_js_callback(UrbcRuntime *rt, int argc, const Value *argv, v
         urbc_runtime_fail(rt, "ffi.callback: missing callback binding");
         return out;
     }
+    if (!urbnapi_callback_on_creator_thread(binding)) {
+        urbc_runtime_fail(rt, "ffi.callback: Node callbacks must run on the creator thread");
+        return out;
+    }
     if (napi_open_handle_scope(env, &scope) != napi_ok) {
         urbc_runtime_fail(rt, "ffi.callback: failed to open handle scope");
         return out;
@@ -935,6 +1188,341 @@ static napi_value urbnapi_describe(napi_env env, napi_callback_info info)
     return out;
 }
 
+/*
+ * Describe a descriptor JS object (from the high-level wrapper) by
+ * synthesizing a native-callable signature string. Complex layout
+ * types (struct/union/array/function) are currently represented as
+ * `pointer` in the synthesized signature (pointer-fallback).
+ */
+static char *urbnapi_leaf_from_abi_type(napi_env env, napi_value abi, char *err, size_t err_cap)
+{
+    napi_valuetype t;
+    if (napi_typeof(env, abi, &t) != napi_ok) {
+        snprintf(err, err_cap, "invalid ABI type");
+        return NULL;
+    }
+    if (t == napi_string) {
+        char *s = NULL;
+        if (!urbnapi_dup_string(env, abi, &s, err, err_cap)) return NULL;
+        return s; /* caller frees */
+    }
+    if (t != napi_object) {
+        snprintf(err, err_cap, "ABI type must be object or string");
+        return NULL;
+    }
+
+    napi_value kindv;
+    if (napi_get_named_property(env, abi, "kind", &kindv) != napi_ok) {
+        snprintf(err, err_cap, "ABI type missing kind");
+        return NULL;
+    }
+    char *kind = NULL;
+    if (!urbnapi_dup_string(env, kindv, &kind, err, err_cap)) return NULL;
+
+    if (strcmp(kind, "void") == 0) {
+        free(kind);
+        return urbnapi_strdup("void");
+    }
+    if (strcmp(kind, "primitive") == 0) {
+        napi_value namev;
+        if (napi_get_named_property(env, abi, "name", &namev) != napi_ok) {
+            free(kind);
+            snprintf(err, err_cap, "primitive ABI missing name");
+            return NULL;
+        }
+        char *name = NULL;
+        if (!urbnapi_dup_string(env, namev, &name, err, err_cap)) { free(kind); return NULL; }
+        free(kind);
+        return name; /* already heap allocated */
+    }
+    if (strcmp(kind, "cstring") == 0) { free(kind); return urbnapi_strdup("cstring"); }
+    if (strcmp(kind, "pointer") == 0) { free(kind); return urbnapi_strdup("pointer"); }
+    if (strcmp(kind, "enum") == 0) {
+        napi_value undv;
+        if (napi_get_named_property(env, abi, "underlying", &undv) != napi_ok) {
+            free(kind);
+            snprintf(err, err_cap, "enum missing underlying type");
+            return NULL;
+        }
+        free(kind);
+        return urbnapi_leaf_from_abi_type(env, undv, err, err_cap);
+    }
+
+    /* array/struct/union/function/etc => pointer fallback */
+    free(kind);
+    return urbnapi_strdup("pointer");
+}
+
+static napi_value urbnapi_describe_descriptor(napi_env env, napi_callback_info info)
+{
+    napi_value argv[1];
+    size_t argc = 1;
+    char err[URBC_ERROR_CAP];
+    DescriptorHandle *wrap;
+    char *sig = NULL;
+
+    NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+    if (argc < 1) {
+        napi_throw_type_error(env, NULL, "describeDescriptor expects a descriptor object");
+        return NULL;
+    }
+
+    napi_value desc_obj = argv[0];
+    napi_value typev;
+    if (napi_get_named_property(env, desc_obj, "type", &typev) != napi_ok) {
+        napi_throw_type_error(env, NULL, "descriptor missing type");
+        return NULL;
+    }
+
+    /* Expect a function-type descriptor */
+    napi_value kindv; char *kind = NULL;
+    if (napi_get_named_property(env, typev, "kind", &kindv) != napi_ok ||
+        !urbnapi_dup_string(env, kindv, &kind, err, sizeof(err))) {
+        napi_throw_type_error(env, NULL, "invalid descriptor.type.kind");
+        return NULL;
+    }
+    if (strcmp(kind, "function") != 0) {
+        free(kind);
+        napi_throw_type_error(env, NULL, "describeDescriptor currently only supports function types");
+        return NULL;
+    }
+    free(kind);
+
+    /* Build native-friendly signature string: <ret> <name>(<args...>) with pointer-fallback */
+    /* debug: if we generated layout tags, show them */
+    char *name = NULL;
+    napi_value namev;
+    if (napi_get_named_property(env, typev, "name", &namev) == napi_ok) {
+        (void)urbnapi_dup_string(env, namev, &name, err, sizeof(err));
+    }
+    if (!name) name = urbnapi_strdup("fn");
+
+    /* optional host-provided layouts: { ret, args } */
+    napi_value layouts_obj = NULL;
+    napi_value layouts_ret = NULL;
+    napi_value layouts_args = NULL;
+    bool have_layouts = false;
+    if (napi_get_named_property(env, desc_obj, "layouts", &layouts_obj) == napi_ok && !urbnapi_is_nullish(env, layouts_obj)) {
+        have_layouts = true;
+        (void)napi_get_named_property(env, layouts_obj, "ret", &layouts_ret);
+        (void)napi_get_named_property(env, layouts_obj, "args", &layouts_args);
+    }
+
+    napi_value retv;
+    if (napi_get_named_property(env, typev, "ret", &retv) != napi_ok) {
+        free(name); napi_throw_type_error(env, NULL, "function type missing ret"); return NULL;
+    }
+    char *ret_leaf = urbnapi_leaf_from_abi_type(env, retv, err, sizeof(err));
+    if (!ret_leaf) { free(name); napi_throw_type_error(env, NULL, err); return NULL; }
+    char *ret_tag = NULL;
+    static unsigned int urbnapi_layout_seq = 1;
+    if (have_layouts && strcmp(ret_leaf, "pointer") == 0 && !urbnapi_is_nullish(env, layouts_ret)) {
+        /* if layout is not a pointer marker, attach by-value/array struct types */
+        napi_valuetype ltype; napi_typeof(env, layouts_ret, &ltype);
+        bool is_arr = false; napi_is_array(env, layouts_ret, &is_arr);
+        if (is_arr || ltype == napi_object) {
+            napi_value ptrv; if (!(napi_get_named_property(env, layouts_ret, "__pointer", &ptrv) == napi_ok && !urbnapi_is_nullish(env, ptrv))) {
+                char tbuf[64]; snprintf(tbuf, sizeof(tbuf), "urb_layout_%u", urbnapi_layout_seq++);
+                ret_tag = urbnapi_strdup(tbuf);
+                size_t newlen = strlen("pointer()") + strlen(ret_tag) + 8;
+                char *rl = (char *)malloc(newlen);
+                if (!rl) { free(ret_leaf); free(name); napi_throw_error(env, NULL, "out of memory"); return NULL; }
+                snprintf(rl, newlen, "pointer(%s)", ret_tag);
+                free(ret_leaf); ret_leaf = rl;
+            }
+        }
+    }
+
+    napi_value argv_arr;
+    if (napi_get_named_property(env, typev, "args", &argv_arr) != napi_ok) {
+        free(name); free(ret_leaf); napi_throw_type_error(env, NULL, "function type missing args"); return NULL;
+    }
+    uint32_t argc_len = 0;
+    if (napi_get_array_length(env, argv_arr, &argc_len) != napi_ok) argc_len = 0;
+
+    char **arg_leaves = NULL;
+    if (argc_len > 0) {
+        arg_leaves = (char **)calloc((size_t)argc_len, sizeof(char*));
+        if (!arg_leaves) { free(name); free(ret_leaf); napi_throw_error(env, NULL, "out of memory"); return NULL; }
+    }
+
+    /* optional per-arg layout values and tags */
+    napi_value *arg_layout_vals = NULL;
+    char **arg_tags = NULL;
+    if (have_layouts && argc_len > 0) {
+        arg_layout_vals = (napi_value *)calloc((size_t)argc_len, sizeof(napi_value));
+        arg_tags = (char **)calloc((size_t)argc_len, sizeof(char*));
+        if (!arg_layout_vals || !arg_tags) {
+            free(name); free(ret_leaf); free(arg_leaves);
+            free(arg_layout_vals); free(arg_tags);
+            napi_throw_error(env, NULL, "out of memory"); return NULL;
+        }
+    }
+
+    size_t total_len = strlen(ret_leaf) + 1 + strlen(name) + 2; /* ret + space + name + () */
+    for (uint32_t i = 0; i < argc_len; i++) {
+        napi_value aelem; napi_get_element(env, argv_arr, i, &aelem);
+        arg_leaves[i] = urbnapi_leaf_from_abi_type(env, aelem, err, sizeof(err));
+        if (!arg_leaves[i]) {
+            for (uint32_t j = 0; j < i; j++) free(arg_leaves[j]);
+            free(arg_leaves); free(name); free(ret_leaf);
+            free(arg_layout_vals); free(arg_tags);
+            napi_throw_type_error(env, NULL, err);
+            return NULL;
+        }
+        /* if leaf is pointer and host supplied a layout for this arg, create a tag */
+        if (have_layouts && strcmp(arg_leaves[i], "pointer") == 0 && !urbnapi_is_nullish(env, layouts_args)) {
+            napi_value layout_elem; napi_get_element(env, layouts_args, i, &layout_elem);
+            arg_layout_vals[i] = layout_elem;
+            if (!urbnapi_is_nullish(env, layout_elem)) {
+                napi_valuetype ltype; napi_typeof(env, layout_elem, &ltype);
+                bool is_arr = false; napi_is_array(env, layout_elem, &is_arr);
+                if (is_arr || ltype == napi_object) {
+                    napi_value ptrv; if (!(napi_get_named_property(env, layout_elem, "__pointer", &ptrv) == napi_ok && !urbnapi_is_nullish(env, ptrv))) {
+                        char tbuf[64]; snprintf(tbuf, sizeof(tbuf), "urb_layout_%u", urbnapi_layout_seq++);
+                        arg_tags[i] = urbnapi_strdup(tbuf);
+                        size_t newlen = strlen("pointer()") + strlen(arg_tags[i]) + 8;
+                        char *al = (char *)malloc(newlen);
+                        if (!al) {
+                            for (uint32_t j = 0; j <= i; j++) free(arg_leaves[j]);
+                            free(arg_leaves); free(name); free(ret_leaf);
+                            for (uint32_t j = 0; j < argc_len; j++) free(arg_tags[j]);
+                            free(arg_layout_vals); free(arg_tags);
+                            napi_throw_error(env, NULL, "out of memory"); return NULL;
+                        }
+                        snprintf(al, newlen, "pointer(%s)", arg_tags[i]);
+                        free(arg_leaves[i]); arg_leaves[i] = al;
+                    }
+                }
+            }
+        } else if (have_layouts && layouts_args) {
+            /* record layout element even if no tag created, for later checks */
+            napi_value layout_elem; napi_get_element(env, layouts_args, i, &layout_elem);
+            arg_layout_vals[i] = layout_elem;
+        }
+        total_len += strlen(arg_leaves[i]) + 2; /* comma + space */
+    }
+
+    napi_value varv; bool varargs = false;
+    if (napi_get_named_property(env, typev, "varargs", &varv) == napi_ok) {
+        napi_valuetype vt; napi_typeof(env, varv, &vt);
+        if (vt == napi_boolean) { napi_get_value_bool(env, varv, &varargs); }
+    }
+    if (varargs) total_len += 4; /* for ..., */
+
+    sig = (char *)malloc(total_len + 16);
+    if (!sig) {
+        for (uint32_t i = 0; i < argc_len; i++) free(arg_leaves[i]);
+        free(arg_leaves); free(name); free(ret_leaf);
+        napi_throw_error(env, NULL, "out of memory"); return NULL;
+    }
+
+    /* Compose signature */
+    char *p = sig;
+    size_t need = total_len + 1;
+    snprintf(p, need, "%s %s(", ret_leaf, name);
+    for (uint32_t ii = 0; ii < argc_len; ii++) {
+        if (ii > 0) strcat(p, ", ");
+        strcat(p, arg_leaves[ii]);
+    }
+    if (varargs) {
+        if (argc_len > 0) strcat(p, ", ..."); else strcat(p, "...");
+    }
+    strcat(p, ")");
+    strcat(p, ")");
+
+    /* Do not free leaf/tag buffers yet — we may need them while attaching types. */
+
+    wrap = (DescriptorHandle *)calloc(1, sizeof(*wrap));
+    if (!wrap) { free(sig); napi_throw_error(env, NULL, "out of memory"); return NULL; }
+    if (urbc_ffi_describe(sig, &wrap->descriptor, err, sizeof(err)) != URBC_OK) {
+        free(sig); free(wrap);
+        napi_throw_type_error(env, NULL, err[0] ? err : "failed to describe descriptor");
+        return NULL;
+    }
+    free(sig);
+    /* Build and attach dynamic ffi_type graphs for any tagged layouts */
+    if (ret_tag || (arg_tags != NULL)) {
+        /* attach return layout if present */
+        if (ret_tag) {
+            void *owner = NULL;
+            ffi_type *ft = urbnapi_build_layout_to_ffi(env, layouts_ret, &owner, err, sizeof(err));
+            if (!ft) {
+                if (owner) free(owner);
+                urbc_ffi_descriptor_release(wrap->descriptor);
+                free(wrap);
+                /* clean up tags/leaves */
+                if (arg_leaves) { for (uint32_t i = 0; i < argc_len; i++) free(arg_leaves[i]); free(arg_leaves); }
+                if (arg_tags) { for (uint32_t i = 0; i < argc_len; i++) free(arg_tags[i]); free(arg_tags); }
+                if (arg_layout_vals) free(arg_layout_vals);
+                free(ret_tag);
+                free(name);
+                napi_throw_type_error(env, NULL, err[0] ? err : "failed to build layout type");
+                return NULL;
+            }
+            if (urbc_ffi_descriptor_attach_ffi_type(wrap->descriptor, ret_tag, ft, 1, owner, err, sizeof(err)) != URBC_OK) {
+                if (owner) free(owner);
+                urbc_ffi_descriptor_release(wrap->descriptor);
+                free(wrap);
+                if (arg_leaves) { for (uint32_t i = 0; i < argc_len; i++) free(arg_leaves[i]); free(arg_leaves); }
+                if (arg_tags) { for (uint32_t i = 0; i < argc_len; i++) free(arg_tags[i]); free(arg_tags); }
+                if (arg_layout_vals) free(arg_layout_vals);
+                free(ret_tag); free(name);
+                napi_throw_type_error(env, NULL, err[0] ? err : "failed to attach layout type");
+                return NULL;
+            }
+            free(ret_tag);
+            ret_tag = NULL;
+        }
+        /* attach arg layouts */
+        if (arg_tags) {
+            for (uint32_t i = 0; i < argc_len; i++) {
+                if (!arg_tags[i]) continue;
+                void *owner = NULL;
+                napi_value lay = arg_layout_vals ? arg_layout_vals[i] : NULL;
+                ffi_type *ft = urbnapi_build_layout_to_ffi(env, lay, &owner, err, sizeof(err));
+                if (!ft) {
+                    if (owner) free(owner);
+                    urbc_ffi_descriptor_release(wrap->descriptor);
+                    free(wrap);
+                    if (arg_leaves) { for (uint32_t j = 0; j < argc_len; j++) free(arg_leaves[j]); free(arg_leaves); }
+                    if (arg_tags) { for (uint32_t j = 0; j < argc_len; j++) free(arg_tags[j]); free(arg_tags); }
+                    if (arg_layout_vals) free(arg_layout_vals);
+                    free(name);
+                    napi_throw_type_error(env, NULL, err[0] ? err : "failed to build layout type");
+                    return NULL;
+                }
+                if (urbc_ffi_descriptor_attach_ffi_type(wrap->descriptor, arg_tags[i], ft, 1, owner, err, sizeof(err)) != URBC_OK) {
+                    if (owner) free(owner);
+                    urbc_ffi_descriptor_release(wrap->descriptor);
+                    free(wrap);
+                    if (arg_leaves) { for (uint32_t j = 0; j < argc_len; j++) free(arg_leaves[j]); free(arg_leaves); }
+                    if (arg_tags) { for (uint32_t j = 0; j < argc_len; j++) free(arg_tags[j]); free(arg_tags); }
+                    if (arg_layout_vals) free(arg_layout_vals);
+                    free(name);
+                    napi_throw_type_error(env, NULL, err[0] ? err : "failed to attach layout type");
+                    return NULL;
+                }
+                free(arg_tags[i]); arg_tags[i] = NULL;
+            }
+        }
+    }
+
+    /* cleanup local buffers (safe to free here after attachments) */
+    if (arg_leaves) { for (uint32_t i = 0; i < argc_len; i++) free(arg_leaves[i]); free(arg_leaves); }
+    if (arg_tags) { free(arg_tags); }
+    if (arg_layout_vals) free(arg_layout_vals);
+    free(name); free(ret_leaf);
+
+    napi_value out;
+    if (napi_create_external(env, wrap, urbnapi_descriptor_finalize, NULL, &out) != napi_ok) {
+        urbnapi_descriptor_finalize(env, wrap, NULL);
+        urbnapi_throw_status(env, napi_generic_failure, "napi_create_external");
+        return NULL;
+    }
+    return out;
+}
+
 static napi_value urbnapi_bind(napi_env env, napi_callback_info info)
 {
     AddonState *state = urbnapi_state(env);
@@ -1096,6 +1684,11 @@ static napi_value urbnapi_callback(napi_env env, napi_callback_info info)
         return NULL;
     }
     binding->env = env;
+#ifdef _WIN32
+    binding->creator_thread = GetCurrentThreadId();
+#else
+    binding->creator_thread = pthread_self();
+#endif
     if (urbc_ffi_descriptor_copy_parsed(desc_wrap->descriptor, &binding->sig, err, sizeof(err)) != URBC_OK) {
         free(binding);
         napi_throw_error(env, NULL, err);
@@ -1515,6 +2108,7 @@ static napi_value Init(napi_env env, napi_value exports)
         { "sym", 0, urbnapi_sym, 0, 0, 0, napi_default, 0 },
         { "symSelf", 0, urbnapi_sym_self, 0, 0, 0, napi_default, 0 },
         { "describe", 0, urbnapi_describe, 0, 0, 0, napi_default, 0 },
+        { "describeDescriptor", 0, urbnapi_describe_descriptor, 0, 0, 0, napi_default, 0 },
         { "bind", 0, urbnapi_bind, 0, 0, 0, napi_default, 0 },
         { "callBound", 0, urbnapi_call_bound, 0, 0, 0, napi_default, 0 },
         { "callback", 0, urbnapi_callback, 0, 0, 0, napi_default, 0 },
