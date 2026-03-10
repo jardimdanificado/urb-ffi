@@ -36,6 +36,10 @@ typedef struct BoundHandle {
     void *handle;
 } BoundHandle;
 
+typedef struct DescriptorHandle {
+    UrbcFfiDescriptor *descriptor;
+} DescriptorHandle;
+
 typedef struct CallbackHandle {
     void *fn_ptr;
     CallbackBinding *binding;
@@ -704,6 +708,19 @@ static void urbnapi_bound_finalize(napi_env env, void *data, void *hint)
     free(data);
 }
 
+static void urbnapi_descriptor_finalize(napi_env env, void *data, void *hint)
+{
+    DescriptorHandle *wrap = (DescriptorHandle *)data;
+    (void)env;
+    (void)hint;
+    if (!wrap) return;
+    if (wrap->descriptor) {
+        urbc_ffi_descriptor_release(wrap->descriptor);
+        wrap->descriptor = NULL;
+    }
+    free(wrap);
+}
+
 static void urbnapi_callback_finalize(napi_env env, void *data, void *hint)
 {
     (void)env;
@@ -744,6 +761,17 @@ static BoundHandle *urbnapi_unwrap_bound(napi_env env, napi_value value)
     BoundHandle *wrap = NULL;
     if (napi_get_value_external(env, value, (void **)&wrap) != napi_ok) {
         (void)napi_throw_type_error(env, NULL, "expected bound function handle");
+        return NULL;
+    }
+    return wrap;
+}
+
+static DescriptorHandle *urbnapi_unwrap_descriptor(napi_env env, napi_value value)
+{
+    DescriptorHandle *wrap = NULL;
+    if (napi_get_value_external(env, value, (void **)&wrap) != napi_ok ||
+        !wrap || !wrap->descriptor) {
+        (void)napi_throw_type_error(env, NULL, "expected signature descriptor handle");
         return NULL;
     }
     return wrap;
@@ -868,14 +896,53 @@ static napi_value urbnapi_sym_self(napi_env env, napi_callback_info info)
     return urbnapi_make_uintptr(env, (uintptr_t)sym);
 }
 
+static napi_value urbnapi_describe(napi_env env, napi_callback_info info)
+{
+    napi_value argv[1];
+    size_t argc = 1;
+    char *sig = NULL;
+    char err[URBC_ERROR_CAP];
+    DescriptorHandle *wrap;
+    napi_value out;
+
+    NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+    if (argc < 1) {
+        napi_throw_type_error(env, NULL, "ffi.describe expects a signature string");
+        return NULL;
+    }
+    if (!urbnapi_dup_string(env, argv[0], &sig, err, sizeof(err))) {
+        napi_throw_type_error(env, NULL, err);
+        return NULL;
+    }
+    wrap = (DescriptorHandle *)calloc(1, sizeof(*wrap));
+    if (!wrap) {
+        free(sig);
+        napi_throw_error(env, NULL, "out of memory");
+        return NULL;
+    }
+    if (urbc_ffi_describe(sig, &wrap->descriptor, err, sizeof(err)) != URBC_OK) {
+        free(sig);
+        free(wrap);
+        napi_throw_error(env, NULL, err);
+        return NULL;
+    }
+    free(sig);
+    if (napi_create_external(env, wrap, urbnapi_descriptor_finalize, NULL, &out) != napi_ok) {
+        urbnapi_descriptor_finalize(env, wrap, NULL);
+        urbnapi_throw_status(env, napi_generic_failure, "napi_create_external");
+        return NULL;
+    }
+    return out;
+}
+
 static napi_value urbnapi_bind(napi_env env, napi_callback_info info)
 {
     AddonState *state = urbnapi_state(env);
     napi_value argv[2];
     size_t argc = 2;
     uintptr_t ptr = 0;
-    char *sig = NULL;
     char err[URBC_ERROR_CAP];
+    DescriptorHandle *desc_wrap;
     void *bound = NULL;
     BoundHandle *wrap;
     napi_value out;
@@ -886,7 +953,7 @@ static napi_value urbnapi_bind(napi_env env, napi_callback_info info)
     }
     NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
     if (argc < 2) {
-        napi_throw_type_error(env, NULL, "ffi.bind expects a pointer and signature");
+        napi_throw_type_error(env, NULL, "ffi.bind expects a pointer and descriptor");
         return NULL;
     }
     if (!urbnapi_get_pointer(env, argv[0], &ptr, err, sizeof(err))) {
@@ -897,16 +964,12 @@ static napi_value urbnapi_bind(napi_env env, napi_callback_info info)
         napi_throw_error(env, NULL, "ffi.bind: function pointer is null");
         return NULL;
     }
-    if (!urbnapi_dup_string(env, argv[1], &sig, err, sizeof(err))) {
-        napi_throw_type_error(env, NULL, err);
-        return NULL;
-    }
-    if (urbc_ffi_bind(&state->rt, (void *)ptr, sig, &bound, err, sizeof(err)) != URBC_OK) {
-        free(sig);
+    desc_wrap = urbnapi_unwrap_descriptor(env, argv[1]);
+    if (!desc_wrap) return NULL;
+    if (urbc_ffi_bind_desc(&state->rt, (void *)ptr, desc_wrap->descriptor, &bound, err, sizeof(err)) != URBC_OK) {
         napi_throw_error(env, NULL, err);
         return NULL;
     }
-    free(sig);
     wrap = (BoundHandle *)calloc(1, sizeof(*wrap));
     if (!wrap) {
         napi_throw_error(env, NULL, "out of memory");
@@ -1000,10 +1063,9 @@ static napi_value urbnapi_callback(napi_env env, napi_callback_info info)
     napi_value argv[2];
     size_t argc = 2;
     napi_valuetype fn_type;
-    char *sig = NULL;
     char err[URBC_ERROR_CAP];
-    char parse_err[URBC_ERROR_CAP];
     char name[64];
+    DescriptorHandle *desc_wrap;
     CallbackBinding *binding;
     UrbcHostBinding *host;
     void *fn_ptr = NULL;
@@ -1018,29 +1080,25 @@ static napi_value urbnapi_callback(napi_env env, napi_callback_info info)
     }
     NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
     if (argc < 2) {
-        napi_throw_type_error(env, NULL, "ffi.callback expects a signature and function");
+        napi_throw_type_error(env, NULL, "ffi.callback expects a descriptor and function");
         return NULL;
     }
+    desc_wrap = urbnapi_unwrap_descriptor(env, argv[0]);
+    if (!desc_wrap) return NULL;
     NAPI_CALL(env, napi_typeof(env, argv[1], &fn_type));
     if (fn_type != napi_function) {
         napi_throw_type_error(env, NULL, "ffi.callback expects a JavaScript function");
         return NULL;
     }
-    if (!urbnapi_dup_string(env, argv[0], &sig, err, sizeof(err))) {
-        napi_throw_type_error(env, NULL, err);
-        return NULL;
-    }
     binding = (CallbackBinding *)calloc(1, sizeof(*binding));
     if (!binding) {
-        free(sig);
         napi_throw_error(env, NULL, "out of memory");
         return NULL;
     }
     binding->env = env;
-    if (!fsig_parse(sig, &binding->sig, parse_err, sizeof(parse_err))) {
-        free(sig);
+    if (urbc_ffi_descriptor_copy_parsed(desc_wrap->descriptor, &binding->sig, err, sizeof(err)) != URBC_OK) {
         free(binding);
-        napi_throw_error(env, NULL, parse_err);
+        napi_throw_error(env, NULL, err);
         return NULL;
     }
     NAPI_CALL(env, napi_create_reference(env, argv[1], 1, &binding->fn_ref));
@@ -1050,22 +1108,19 @@ static napi_value urbnapi_callback(napi_env env, napi_callback_info info)
     snprintf(name, sizeof(name), "node_cb_%llu", (unsigned long long)++state->next_callback_id);
     if (urbc_runtime_register_host(&state->rt, name, urbnapi_js_callback, binding,
                                    err, sizeof(err)) != URBC_OK) {
-        free(sig);
         napi_throw_error(env, NULL, err);
         return NULL;
     }
     host = urbc_runtime_find_host(&state->rt, name);
     if (!host) {
-        free(sig);
         napi_throw_error(env, NULL, "ffi.callback: failed to resolve host binding");
         return NULL;
     }
-    if (urbc_ffi_callback(&state->rt, sig, (Value){ .p = host }, &fn_ptr, err, sizeof(err)) != URBC_OK) {
-        free(sig);
+    if (urbc_ffi_callback_desc(&state->rt, desc_wrap->descriptor,
+                               (Value){ .p = host }, &fn_ptr, err, sizeof(err)) != URBC_OK) {
         napi_throw_error(env, NULL, err);
         return NULL;
     }
-    free(sig);
     wrap = (CallbackHandle *)calloc(1, sizeof(*wrap));
     if (!wrap) {
         napi_throw_error(env, NULL, "out of memory");
@@ -1459,6 +1514,7 @@ static napi_value Init(napi_env env, napi_value exports)
         { "close", 0, urbnapi_close, 0, 0, 0, napi_default, 0 },
         { "sym", 0, urbnapi_sym, 0, 0, 0, napi_default, 0 },
         { "symSelf", 0, urbnapi_sym_self, 0, 0, 0, napi_default, 0 },
+        { "describe", 0, urbnapi_describe, 0, 0, 0, napi_default, 0 },
         { "bind", 0, urbnapi_bind, 0, 0, 0, napi_default, 0 },
         { "callBound", 0, urbnapi_call_bound, 0, 0, 0, napi_default, 0 },
         { "callback", 0, urbnapi_callback, 0, 0, 0, napi_default, 0 },

@@ -865,6 +865,7 @@ static napi_value urbnapi_bind(napi_env env, napi_callback_info info)
     size_t argc = 2;
     uintptr_t ptr = 0;
     char *sig = NULL;
+    UrbcFfiDescriptor *desc = NULL;
     char err[URBC_ERROR_CAP];
     void *bound = NULL;
     BoundHandle *wrap;
@@ -891,11 +892,18 @@ static napi_value urbnapi_bind(napi_env env, napi_callback_info info)
         napi_throw_type_error(env, NULL, err);
         return NULL;
     }
-    if (urbc_ffi_bind(&state->rt, (void *)ptr, sig, &bound, err, sizeof(err)) != URBC_OK) {
+    if (urbc_ffi_describe(sig, &desc, err, sizeof(err)) != URBC_OK) {
         free(sig);
         napi_throw_error(env, NULL, err);
         return NULL;
     }
+    if (urbc_ffi_bind_desc(&state->rt, (void *)ptr, desc, &bound, err, sizeof(err)) != URBC_OK) {
+        urbc_ffi_descriptor_release(desc);
+        free(sig);
+        napi_throw_error(env, NULL, err);
+        return NULL;
+    }
+    urbc_ffi_descriptor_release(desc);
     free(sig);
     wrap = (BoundHandle *)calloc(1, sizeof(*wrap));
     if (!wrap) {
@@ -991,8 +999,9 @@ static napi_value urbnapi_callback(napi_env env, napi_callback_info info)
     size_t argc = 2;
     napi_valuetype fn_type;
     char *sig = NULL;
+    UrbcFfiDescriptor *desc = NULL;
+    FsigParsed parsed_sig;
     char err[URBC_ERROR_CAP];
-    char parse_err[URBC_ERROR_CAP];
     char name[64];
     CallbackBinding *binding;
     UrbcHostBinding *host;
@@ -1020,19 +1029,26 @@ static napi_value urbnapi_callback(napi_env env, napi_callback_info info)
         napi_throw_type_error(env, NULL, err);
         return NULL;
     }
+    if (urbc_ffi_describe(sig, &desc, err, sizeof(err)) != URBC_OK) {
+        free(sig);
+        napi_throw_error(env, NULL, err);
+        return NULL;
+    }
+    if (urbc_ffi_descriptor_copy_parsed(desc, &parsed_sig, err, sizeof(err)) != URBC_OK) {
+        urbc_ffi_descriptor_release(desc);
+        free(sig);
+        napi_throw_error(env, NULL, err);
+        return NULL;
+    }
     binding = (CallbackBinding *)calloc(1, sizeof(*binding));
     if (!binding) {
+        urbc_ffi_descriptor_release(desc);
         free(sig);
         napi_throw_error(env, NULL, "out of memory");
         return NULL;
     }
     binding->env = env;
-    if (!fsig_parse(sig, &binding->sig, parse_err, sizeof(parse_err))) {
-        free(sig);
-        free(binding);
-        napi_throw_error(env, NULL, parse_err);
-        return NULL;
-    }
+    binding->sig = parsed_sig;
     NAPI_CALL(env, napi_create_reference(env, argv[1], 1, &binding->fn_ref));
     binding->next = state->callbacks;
     state->callbacks = binding;
@@ -1040,21 +1056,25 @@ static napi_value urbnapi_callback(napi_env env, napi_callback_info info)
     snprintf(name, sizeof(name), "node_cb_%llu", (unsigned long long)++state->next_callback_id);
     if (urbc_runtime_register_host(&state->rt, name, urbnapi_js_callback, binding,
                                    err, sizeof(err)) != URBC_OK) {
+        urbc_ffi_descriptor_release(desc);
         free(sig);
         napi_throw_error(env, NULL, err);
         return NULL;
     }
     host = urbc_runtime_find_host(&state->rt, name);
     if (!host) {
+        urbc_ffi_descriptor_release(desc);
         free(sig);
         napi_throw_error(env, NULL, "ffi.callback: failed to resolve host binding");
         return NULL;
     }
-    if (urbc_ffi_callback(&state->rt, sig, (Value){ .p = host }, &fn_ptr, err, sizeof(err)) != URBC_OK) {
+    if (urbc_ffi_callback_desc(&state->rt, desc, (Value){ .p = host }, &fn_ptr, err, sizeof(err)) != URBC_OK) {
+        urbc_ffi_descriptor_release(desc);
         free(sig);
         napi_throw_error(env, NULL, err);
         return NULL;
     }
+    urbc_ffi_descriptor_release(desc);
     free(sig);
     wrap = (CallbackHandle *)calloc(1, sizeof(*wrap));
     if (!wrap) {

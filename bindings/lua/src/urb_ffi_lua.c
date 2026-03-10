@@ -10,7 +10,6 @@
 
 #define URBC_IMPLEMENTATION
 #include "../../../dist/urbc.h"
-#include "../../node/src/ffi_sig.h"
 
 typedef struct AddonState AddonState;
 typedef struct CallbackBinding CallbackBinding;
@@ -25,6 +24,11 @@ typedef struct LuaBoundHandle {
     AddonState *state;
     void *handle;
 } LuaBoundHandle;
+
+typedef struct LuaDescriptorHandle {
+    AddonState *state;
+    UrbcFfiDescriptor *descriptor;
+} LuaDescriptorHandle;
 
 typedef struct LuaCallbackHandle {
     AddonState *state;
@@ -48,6 +52,7 @@ struct AddonState {
 
 #define URB_LUA_LIB_MT "urb_ffi.lib"
 #define URB_LUA_BOUND_MT "urb_ffi.bound"
+#define URB_LUA_DESC_MT "urb_ffi.desc"
 #define URB_LUA_CALLBACK_MT "urb_ffi.callback"
 #define URB_LUA_STATE_MT "urb_ffi.state"
 
@@ -511,6 +516,11 @@ static LuaBoundHandle *urblua_check_bound(lua_State *L, int idx)
     return (LuaBoundHandle *)luaL_checkudata(L, idx, URB_LUA_BOUND_MT);
 }
 
+static LuaDescriptorHandle *urblua_check_desc(lua_State *L, int idx)
+{
+    return (LuaDescriptorHandle *)luaL_checkudata(L, idx, URB_LUA_DESC_MT);
+}
+
 static int urblua_lib_gc(lua_State *L)
 {
     LuaLibHandle *wrap = (LuaLibHandle *)luaL_checkudata(L, 1, URB_LUA_LIB_MT);
@@ -525,6 +535,16 @@ static int urblua_lib_gc(lua_State *L)
 static int urblua_bound_gc(lua_State *L)
 {
     (void)luaL_checkudata(L, 1, URB_LUA_BOUND_MT);
+    return 0;
+}
+
+static int urblua_desc_gc(lua_State *L)
+{
+    LuaDescriptorHandle *wrap = (LuaDescriptorHandle *)luaL_checkudata(L, 1, URB_LUA_DESC_MT);
+    if (wrap->descriptor) {
+        urbc_ffi_descriptor_release(wrap->descriptor);
+        wrap->descriptor = NULL;
+    }
     return 0;
 }
 
@@ -618,11 +638,29 @@ static int urblua_sym_self(lua_State *L)
     return 1;
 }
 
+static int urblua_describe(lua_State *L)
+{
+    AddonState *state = urblua_state(L);
+    const char *sig = luaL_checkstring(L, 1);
+    char err[URBC_ERROR_CAP];
+    LuaDescriptorHandle *wrap;
+
+    wrap = (LuaDescriptorHandle *)lua_newuserdatauv(L, sizeof(*wrap), 0);
+    memset(wrap, 0, sizeof(*wrap));
+    wrap->state = state;
+    if (urbc_ffi_describe(sig, &wrap->descriptor, err, sizeof(err)) != URBC_OK) {
+        lua_pop(L, 1);
+        return urblua_error(L, err);
+    }
+    luaL_setmetatable(L, URB_LUA_DESC_MT);
+    return 1;
+}
+
 static int urblua_bind(lua_State *L)
 {
     AddonState *state = urblua_state(L);
     uintptr_t ptr = 0;
-    const char *sig = luaL_checkstring(L, 2);
+    LuaDescriptorHandle *desc = urblua_check_desc(L, 2);
     char err[URBC_ERROR_CAP];
     void *bound = NULL;
     LuaBoundHandle *wrap;
@@ -633,7 +671,10 @@ static int urblua_bind(lua_State *L)
     if (ptr == 0) {
         return urblua_error(L, "ffi.bind: function pointer is null");
     }
-    if (urbc_ffi_bind(&state->rt, (void *)ptr, sig, &bound, err, sizeof(err)) != URBC_OK) {
+    if (!desc->descriptor) {
+        return urblua_error(L, "ffi.bind: invalid descriptor");
+    }
+    if (urbc_ffi_bind_desc(&state->rt, (void *)ptr, desc->descriptor, &bound, err, sizeof(err)) != URBC_OK) {
         return urblua_error(L, err);
     }
 
@@ -708,9 +749,8 @@ static int urblua_call_bound(lua_State *L)
 static int urblua_callback(lua_State *L)
 {
     AddonState *state = urblua_state(L);
-    const char *sig = luaL_checkstring(L, 1);
+    LuaDescriptorHandle *desc = urblua_check_desc(L, 1);
     char err[URBC_ERROR_CAP];
-    char parse_err[URBC_ERROR_CAP];
     char name[64];
     CallbackBinding *binding;
     UrbcHostBinding *host;
@@ -724,9 +764,9 @@ static int urblua_callback(lua_State *L)
         return urblua_error(L, "out of memory");
     }
     binding->L = L;
-    if (!fsig_parse(sig, &binding->sig, parse_err, sizeof(parse_err))) {
+    if (urbc_ffi_descriptor_copy_parsed(desc->descriptor, &binding->sig, err, sizeof(err)) != URBC_OK) {
         free(binding);
-        return urblua_error(L, parse_err);
+        return urblua_error(L, err);
     }
 
     lua_pushvalue(L, 2);
@@ -743,7 +783,10 @@ static int urblua_callback(lua_State *L)
     if (!host) {
         return urblua_error(L, "ffi.callback: failed to resolve host binding");
     }
-    if (urbc_ffi_callback(&state->rt, sig, (Value){ .p = host }, &fn_ptr, err, sizeof(err)) != URBC_OK) {
+    if (!desc->descriptor) {
+        return urblua_error(L, "ffi.callback: invalid descriptor");
+    }
+    if (urbc_ffi_callback_desc(&state->rt, desc->descriptor, (Value){ .p = host }, &fn_ptr, err, sizeof(err)) != URBC_OK) {
         return urblua_error(L, err);
     }
 
@@ -1066,6 +1109,7 @@ int luaopen_urb_ffi_native(lua_State *L)
     luaL_checkversion(L);
     urblua_create_metatable(L, URB_LUA_LIB_MT, urblua_lib_gc);
     urblua_create_metatable(L, URB_LUA_BOUND_MT, urblua_bound_gc);
+    urblua_create_metatable(L, URB_LUA_DESC_MT, urblua_desc_gc);
     urblua_create_metatable(L, URB_LUA_CALLBACK_MT, urblua_callback_gc);
     urblua_create_metatable(L, URB_LUA_STATE_MT, urblua_state_gc);
 
@@ -1084,6 +1128,7 @@ int luaopen_urb_ffi_native(lua_State *L)
     urblua_setfunc(L, -1, -2, "close", urblua_close);
     urblua_setfunc(L, -1, -2, "sym", urblua_sym);
     urblua_setfunc(L, -1, -2, "sym_self", urblua_sym_self);
+    urblua_setfunc(L, -1, -2, "describe", urblua_describe);
     urblua_setfunc(L, -1, -2, "bind", urblua_bind);
     urblua_setfunc(L, -1, -2, "call_bound", urblua_call_bound);
     urblua_setfunc(L, -1, -2, "callback", urblua_callback);

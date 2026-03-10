@@ -19,8 +19,11 @@ const runtimeLibs = process.platform === 'win32'
 		: ['libc.so.6'];
 
 const { handle: libc, name } = openFirst(runtimeLibs);
-const puts = ffi.bind(ffi.sym(libc, 'puts'), 'i32 puts(cstring)');
-const qsort = ffi.bind(ffi.sym(libc, 'qsort'), 'void qsort(pointer, u64, u64, pointer)');
+const putsDesc = ffi.describe('i32 puts(cstring)');
+const qsortDesc = ffi.describe('void qsort(pointer, u64, u64, pointer)');
+const cmpDesc = ffi.describe('i32 cmp(pointer, pointer)');
+const puts = ffi.bind(ffi.sym(libc, 'puts'), putsDesc);
+const qsort = ffi.bind(ffi.sym(libc, 'qsort'), qsortDesc);
 
 puts(`hello from urb-ffi smoke (${process.platform}) via ${name}`);
 
@@ -30,7 +33,7 @@ for (let i = 0; i < nums.length; i++) {
 	mem.writei32(buf + BigInt(i * 4), nums[i]);
 }
 
-const cmp = ffi.callback('i32 cmp(pointer, pointer)', (a, b) => {
+const cmp = ffi.callback(cmpDesc, (a, b) => {
 	const va = mem.readi32(a);
 	const vb = mem.readi32(b);
 	return va < vb ? -1 : va > vb ? 1 : 0;

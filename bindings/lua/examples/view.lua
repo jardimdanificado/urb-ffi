@@ -48,7 +48,8 @@ local ClockSchema = {
     { name = "tv_nsec", type = "i64" },
 }
 local clock_ptr = mem.alloc(mem.struct_sizeof(ClockSchema))
-local clockgettime = ffi.bind(ffi.sym(libc, "clock_gettime"), "i32 clock_gettime(i32, pointer)")
+local clockgettime_desc = ffi.describe("i32 clock_gettime(i32, pointer)")
+local clockgettime = ffi.bind(ffi.sym(libc, "clock_gettime"), clockgettime_desc)
 clockgettime(0, clock_ptr)
 local ts = mem.view(clock_ptr, ClockSchema)
 print("tv_nsec =", ts.tv_nsec)

@@ -216,14 +216,20 @@ Lua example:
 local urb = require('urb_ffi')
 local ffi = urb.ffi
 
-local puts = ffi.bind(ffi.sym_self('puts'), 'i32 puts(cstring)')
-local strlen = ffi.bind(ffi.sym_self('strlen'), 'u64 strlen(cstring)')
+local puts_desc = ffi.describe('i32 puts(cstring)')
+local strlen_desc = ffi.describe('u64 strlen(cstring)')
+local puts = ffi.bind(ffi.sym_self('puts'), puts_desc)
+local strlen = ffi.bind(ffi.sym_self('strlen'), strlen_desc)
 
 puts('hello world from sym_self')
 print(strlen('hello world from sym_self'))
 ```
 
-### `ffi.bind(ptr, signature)`
+### `ffi.describe(signature)`
+
+Parses a signature string once and returns a reusable descriptor object.
+
+### `ffi.bind(ptr, descriptor)`
 
 Binds a native function pointer to a callable host object.
 
@@ -276,9 +282,10 @@ Node example:
 const { ffi, memory: mem } = require('urb-ffi');
 
 const libc = ffi.open('libc.so.6');
+const snprintfDesc = ffi.describe('i32 snprintf(pointer, u64, cstring, ...)');
 const snprintf = ffi.bind(
   ffi.sym(libc, 'snprintf'),
-  'i32 snprintf(pointer, u64, cstring, ...)'
+  snprintfDesc
 );
 
 const buf = mem.alloc(64n);
@@ -297,7 +304,7 @@ For variadic arguments, the runtime infers a suitable native type from the host 
 - floating-point values → `f64`
 - null/pointer-like values → `pointer`
 
-### `ffi.callback(signature, fn)`
+### `ffi.callback(descriptor, fn)`
 
 Creates a real C-callable function pointer backed by a JavaScript or Lua function.
 
@@ -313,12 +320,14 @@ Node example:
 const { ffi, memory: mem } = require('urb-ffi');
 
 const libc = ffi.open('libc.so.6');
-const qsort = ffi.bind(ffi.sym(libc, 'qsort'), 'void qsort(pointer, u64, u64, pointer)');
+const qsortDesc = ffi.describe('void qsort(pointer, u64, u64, pointer)');
+const cmpDesc = ffi.describe('i32 cmp(pointer, pointer)');
+const qsort = ffi.bind(ffi.sym(libc, 'qsort'), qsortDesc);
 
 const buf = mem.alloc(5n * 4n);
 mem.writeArray(buf, 'i32', [42, 7, 99, -3, 15]);
 
-const cmp = ffi.callback('i32 cmp(pointer, pointer)', (a, b) => {
+const cmp = ffi.callback(cmpDesc, (a, b) => {
   const va = mem.readi32(a);
   const vb = mem.readi32(b);
   return va < vb ? -1 : va > vb ? 1 : 0;
@@ -623,8 +632,9 @@ const { ffi, memory } = require('urb-ffi');
 - `ffi.close(handle)`
 - `ffi.sym(handle, name)`
 - `ffi.sym_self(name)`
-- `ffi.bind(ptr, signature)`
-- `ffi.callback(signature, fn)`
+- `ffi.describe(signature)`
+- `ffi.bind(ptr, descriptor)`
+- `ffi.callback(descriptor, fn)`
 - `ffi.errno()`
 - `ffi.dlerror()`
 
@@ -675,8 +685,9 @@ local ffi, memory = urb.ffi, urb.memory
 - `ffi.close(handle)`
 - `ffi.sym(handle, name)`
 - `ffi.sym_self(name)`
-- `ffi.bind(ptr, signature)`
-- `ffi.callback(signature, fn)`
+- `ffi.describe(signature)`
+- `ffi.bind(ptr, descriptor)`
+- `ffi.callback(descriptor, fn)`
 - `ffi.errno()`
 - `ffi.dlerror()`
 

@@ -9,8 +9,10 @@ print("urb-ffi ffi.sym_self demo (lua)")
 
 local puts_ptr = ffi.sym_self("puts")
 local strlen_ptr = ffi.sym_self("strlen")
-local puts = ffi.bind(puts_ptr, "i32 puts(cstring)")
-local strlen = ffi.bind(strlen_ptr, "u64 strlen(cstring)")
+local puts_desc = ffi.describe("i32 puts(cstring)")
+local strlen_desc = ffi.describe("u64 strlen(cstring)")
+local puts = ffi.bind(puts_ptr, puts_desc)
+local strlen = ffi.bind(strlen_ptr, strlen_desc)
 local text = "hello world from sym_self"
 
 puts(text)

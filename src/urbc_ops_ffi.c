@@ -32,7 +32,82 @@ typedef struct UrbcCallbackClosure {
     UrbcHostBinding *binding;
 } UrbcCallbackClosure;
 
+typedef struct UrbcFfiDescriptorCacheEntry {
+    char *signature;
+    UrbcFfiDescriptor *descriptor;
+} UrbcFfiDescriptorCacheEntry;
+
+struct UrbcFfiDescriptor {
+    uint32_t magic;
+    FsigParsed sig;
+};
+
+#define URBC_FFI_DESC_MAGIC 0x55464453u
+
 static void urbc_callback_trampoline(ffi_cif *cif, void *ret, void **args, void *user);
+
+static int urbc_ffi_descriptor_valid(const UrbcFfiDescriptor *desc)
+{
+    return desc && desc->magic == URBC_FFI_DESC_MAGIC;
+}
+
+static UrbcStatus urbc_ffi_descriptor_cache_get(UrbcRuntime *rt,
+                                                const char *sig,
+                                                const UrbcFfiDescriptor **out_desc,
+                                                char *err, size_t err_cap)
+{
+    UHalf i;
+    UrbcFfiDescriptor *desc;
+    UrbcFfiDescriptorCacheEntry *entry;
+    UrbcStatus st;
+
+    if (!rt || !sig || !out_desc) {
+        urbc_copy_error(err, err_cap, "invalid ffi descriptor cache arguments");
+        return URBC_ERR_ARGUMENT;
+    }
+    if (rt->owned_ffi_descriptors) {
+        for (i = 0; i < rt->owned_ffi_descriptors->size; i++) {
+            entry = (UrbcFfiDescriptorCacheEntry *)rt->owned_ffi_descriptors->data[i].p;
+            if (entry && entry->signature && strcmp(entry->signature, sig) == 0 &&
+                urbc_ffi_descriptor_valid(entry->descriptor)) {
+                *out_desc = entry->descriptor;
+                return URBC_OK;
+            }
+        }
+    }
+
+    st = urbc_ffi_describe(sig, &desc, err, err_cap);
+    if (st != URBC_OK) return st;
+
+    if (!rt->owned_ffi_descriptors) {
+        rt->owned_ffi_descriptors = urb_new(4);
+        if (!rt->owned_ffi_descriptors) {
+            urbc_ffi_descriptor_release(desc);
+            urbc_copy_error(err, err_cap, "ffi descriptor cache: out of memory");
+            return URBC_ERR_ALLOC;
+        }
+    }
+
+    entry = (UrbcFfiDescriptorCacheEntry *)calloc(1, sizeof(*entry));
+    if (!entry) {
+        urbc_ffi_descriptor_release(desc);
+        urbc_copy_error(err, err_cap, "ffi descriptor cache: out of memory");
+        return URBC_ERR_ALLOC;
+    }
+
+    entry->signature = (char *)malloc(strlen(sig) + 1);
+    if (!entry->signature) {
+        free(entry);
+        urbc_ffi_descriptor_release(desc);
+        urbc_copy_error(err, err_cap, "ffi descriptor cache: out of memory");
+        return URBC_ERR_ALLOC;
+    }
+    strcpy(entry->signature, sig);
+    entry->descriptor = desc;
+    urb_push(rt->owned_ffi_descriptors, (Value){ .p = entry });
+    *out_desc = desc;
+    return URBC_OK;
+}
 
 static int urbc_ffi_need_stack(List *stack, Int n, const char *name)
 {
@@ -175,15 +250,60 @@ static Value urbc_value_from_ret(FsigBase base, const void *ret)
     return urbc_value_from_memory(prim, ret);
 }
 
-UrbcStatus urbc_ffi_bind_handle(UrbcRuntime *rt, void *fn_ptr, const char *sig,
-                                void **out_handle, char *err, size_t err_cap)
+UrbcStatus urbc_ffi_describe(const char *sig,
+                             UrbcFfiDescriptor **out_desc,
+                             char *err, size_t err_cap)
+{
+    UrbcFfiDescriptor *desc;
+    char parse_err[256];
+
+    if (!sig || !out_desc) {
+        urbc_copy_error(err, err_cap, "invalid ffi.describe arguments");
+        return URBC_ERR_ARGUMENT;
+    }
+    desc = (UrbcFfiDescriptor *)calloc(1, sizeof(*desc));
+    if (!desc) {
+        urbc_copy_error(err, err_cap, "ffi.describe: out of memory");
+        return URBC_ERR_ALLOC;
+    }
+    if (!fsig_parse(sig, &desc->sig, parse_err, sizeof(parse_err))) {
+        free(desc);
+        urbc_copy_error(err, err_cap, parse_err);
+        return URBC_ERR_ARGUMENT;
+    }
+    desc->magic = URBC_FFI_DESC_MAGIC;
+    *out_desc = desc;
+    return URBC_OK;
+}
+
+void urbc_ffi_descriptor_release(UrbcFfiDescriptor *desc)
+{
+    if (!desc) return;
+    desc->magic = 0;
+    free(desc);
+}
+
+UrbcStatus urbc_ffi_descriptor_copy_parsed(const UrbcFfiDescriptor *desc,
+                                           FsigParsed *out_sig,
+                                           char *err, size_t err_cap)
+{
+    if (!urbc_ffi_descriptor_valid(desc) || !out_sig) {
+        urbc_copy_error(err, err_cap, "invalid ffi descriptor");
+        return URBC_ERR_ARGUMENT;
+    }
+    *out_sig = desc->sig;
+    return URBC_OK;
+}
+
+UrbcStatus urbc_ffi_bind_handle_desc(UrbcRuntime *rt, void *fn_ptr,
+                                     const UrbcFfiDescriptor *desc,
+                                     void **out_handle, char *err, size_t err_cap)
 {
     UrbcBoundFn *bf;
     UrbcRuntime *prev;
-    char parse_err[256];
     int i;
     ffi_status st;
-    if (!rt || !sig || !out_handle) {
+    if (!rt || !urbc_ffi_descriptor_valid(desc) || !out_handle) {
         urbc_copy_error(err, err_cap, "invalid ffi.bind arguments");
         return URBC_ERR_ARGUMENT;
     }
@@ -197,10 +317,7 @@ UrbcStatus urbc_ffi_bind_handle(UrbcRuntime *rt, void *fn_ptr, const char *sig,
         urbc_runtime_fail(rt, "ffi.bind: out of memory");
         goto fail;
     }
-    if (!fsig_parse(sig, &bf->sig, parse_err, sizeof(parse_err))) {
-        urbc_runtime_fail(rt, "ffi.bind: %s", parse_err);
-        goto fail;
-    }
+    bf->sig = desc->sig;
     bf->magic = URBC_BOUND_MAGIC;
     bf->fn_ptr = fn_ptr;
     bf->ret_type = urbc_fsig_ffi_type(bf->sig.ret.base);
@@ -234,6 +351,27 @@ fail:
     urbc_runtime_set_current(prev);
     urbc_runtime_unlock(rt);
     return URBC_ERR_RUNTIME;
+}
+
+UrbcStatus urbc_ffi_bind_handle(UrbcRuntime *rt, void *fn_ptr, const char *sig,
+                                void **out_handle, char *err, size_t err_cap)
+{
+    UrbcFfiDescriptor *desc = NULL;
+    UrbcStatus st;
+    char desc_err[URBC_ERROR_CAP];
+
+    if (!rt || !sig || !out_handle) {
+        urbc_copy_error(err, err_cap, "invalid ffi.bind arguments");
+        return URBC_ERR_ARGUMENT;
+    }
+    st = urbc_ffi_describe(sig, &desc, desc_err, sizeof(desc_err));
+    if (st != URBC_OK) {
+        urbc_copy_error(err, err_cap, desc_err);
+        return st;
+    }
+    st = urbc_ffi_bind_handle_desc(rt, fn_ptr, desc, out_handle, err, err_cap);
+    urbc_ffi_descriptor_release(desc);
+    return st;
 }
 
 UrbcStatus urbc_ffi_call_bound(UrbcRuntime *rt, void *bound_handle, int argc,
@@ -322,16 +460,18 @@ fail:
     return URBC_ERR_RUNTIME;
 }
 
-UrbcStatus urbc_ffi_make_callback(UrbcRuntime *rt, const char *sig, Value callable,
-                                  void **out_fn_ptr, char *err, size_t err_cap)
+UrbcStatus urbc_ffi_make_callback_desc(UrbcRuntime *rt,
+                                       const UrbcFfiDescriptor *desc,
+                                       Value callable,
+                                       void **out_fn_ptr,
+                                       char *err, size_t err_cap)
 {
     UrbcHostBinding *binding;
     UrbcCallbackClosure *cb;
     UrbcRuntime *prev;
     ffi_type *ret_type;
-    char parse_err[256];
     int i;
-    if (!rt || !sig || !out_fn_ptr) {
+    if (!rt || !urbc_ffi_descriptor_valid(desc) || !out_fn_ptr) {
         urbc_copy_error(err, err_cap, "invalid ffi.callback arguments");
         return URBC_ERR_ARGUMENT;
     }
@@ -347,11 +487,7 @@ UrbcStatus urbc_ffi_make_callback(UrbcRuntime *rt, const char *sig, Value callab
         urbc_runtime_fail(rt, "ffi.callback: out of memory");
         goto fail;
     }
-    if (!fsig_parse(sig, &cb->sig, parse_err, sizeof(parse_err))) {
-        free(cb);
-        urbc_runtime_fail(rt, "ffi.callback: %s", parse_err);
-        goto fail;
-    }
+    cb->sig = desc->sig;
     if (cb->sig.has_varargs) {
         free(cb);
         urbc_runtime_fail(rt, "ffi.callback: variadic callbacks are not supported");
@@ -413,6 +549,27 @@ fail:
     return URBC_ERR_RUNTIME;
 }
 
+UrbcStatus urbc_ffi_make_callback(UrbcRuntime *rt, const char *sig, Value callable,
+                                  void **out_fn_ptr, char *err, size_t err_cap)
+{
+    UrbcFfiDescriptor *desc = NULL;
+    UrbcStatus st;
+    char desc_err[URBC_ERROR_CAP];
+
+    if (!rt || !sig || !out_fn_ptr) {
+        urbc_copy_error(err, err_cap, "invalid ffi.callback arguments");
+        return URBC_ERR_ARGUMENT;
+    }
+    st = urbc_ffi_describe(sig, &desc, desc_err, sizeof(desc_err));
+    if (st != URBC_OK) {
+        urbc_copy_error(err, err_cap, desc_err);
+        return st;
+    }
+    st = urbc_ffi_make_callback_desc(rt, desc, callable, out_fn_ptr, err, err_cap);
+    urbc_ffi_descriptor_release(desc);
+    return st;
+}
+
 static Value urbc_host_calln(List *stack, int argc, const char *name)
 {
     Value argv[4];
@@ -471,16 +628,32 @@ static void urbc_callback_trampoline(ffi_cif *cif, void *ret, void **args, void 
 
 void urbc_ffi_cleanup_runtime(UrbcRuntime *rt)
 {
-    if (!rt || !rt->owned_callbacks) return;
-    while (rt->owned_callbacks->size > 0) {
-        UrbcCallbackClosure *cb = (UrbcCallbackClosure *)urb_pop(rt->owned_callbacks).p;
-        if (cb) {
-            if (cb->closure) ffi_closure_free(cb->closure);
-            free(cb);
+    if (!rt) return;
+    if (rt->owned_callbacks) {
+        while (rt->owned_callbacks->size > 0) {
+            UrbcCallbackClosure *cb = (UrbcCallbackClosure *)urb_pop(rt->owned_callbacks).p;
+            if (cb) {
+                if (cb->closure) ffi_closure_free(cb->closure);
+                free(cb);
+            }
         }
+        urb_free(rt->owned_callbacks);
+        rt->owned_callbacks = NULL;
     }
-    urb_free(rt->owned_callbacks);
-    rt->owned_callbacks = NULL;
+
+    if (rt->owned_ffi_descriptors) {
+        while (rt->owned_ffi_descriptors->size > 0) {
+            UrbcFfiDescriptorCacheEntry *entry =
+                (UrbcFfiDescriptorCacheEntry *)urb_pop(rt->owned_ffi_descriptors).p;
+            if (entry) {
+                free(entry->signature);
+                urbc_ffi_descriptor_release(entry->descriptor);
+                free(entry);
+            }
+        }
+        urb_free(rt->owned_ffi_descriptors);
+        rt->owned_ffi_descriptors = NULL;
+    }
 }
 
 static void urbc_ffi_calln(List *stack, int argc, const char *name)
@@ -559,18 +732,25 @@ void urbc_op_ffi_sym_self(List *stack)
 void urbc_op_ffi_bind(List *stack)
 {
     Value sigv, ptrv;
+    const UrbcFfiDescriptor *desc = NULL;
     void *handle = NULL;
+    UrbcRuntime *rt = urbc_runtime_current();
     char err[URBC_ERROR_CAP];
     if (!urbc_ffi_need_stack(stack, 2, "ffi.bind")) return;
     sigv = urb_pop(stack);
     ptrv = urb_pop(stack);
     if (!sigv.p) {
-        urbc_runtime_fail(urbc_runtime_current(), "ffi.bind: signature is null");
+        urbc_runtime_fail(rt, "ffi.bind: signature is null");
         return;
     }
-    if (urbc_ffi_bind_handle(urbc_runtime_current(), ptrv.p, (const char *)sigv.p,
-                             &handle, err, sizeof(err)) != URBC_OK) {
-        urbc_runtime_fail(urbc_runtime_current(), "%s", err);
+    if (urbc_ffi_descriptor_cache_get(rt, (const char *)sigv.p, &desc,
+                                      err, sizeof(err)) != URBC_OK) {
+        urbc_runtime_fail(rt, "%s", err);
+        return;
+    }
+    if (urbc_ffi_bind_handle_desc(rt, ptrv.p, desc, &handle,
+                                  err, sizeof(err)) != URBC_OK) {
+        urbc_runtime_fail(rt, "%s", err);
         return;
     }
     urb_push(stack, (Value){ .p = handle });
@@ -585,18 +765,25 @@ void urbc_op_ffi_call4(List *stack) { urbc_ffi_calln(stack, 4, "ffi.call4"); }
 void urbc_op_ffi_callback(List *stack)
 {
     Value callablev, sigv;
+    const UrbcFfiDescriptor *desc = NULL;
     void *fn_ptr = NULL;
+    UrbcRuntime *rt = urbc_runtime_current();
     char err[URBC_ERROR_CAP];
     if (!urbc_ffi_need_stack(stack, 2, "ffi.callback")) return;
     callablev = urb_pop(stack);
     sigv = urb_pop(stack);
     if (!sigv.p) {
-        urbc_runtime_fail(urbc_runtime_current(), "ffi.callback: signature is null");
+        urbc_runtime_fail(rt, "ffi.callback: signature is null");
         return;
     }
-    if (urbc_ffi_make_callback(urbc_runtime_current(), (const char *)sigv.p, callablev,
-                               &fn_ptr, err, sizeof(err)) != URBC_OK) {
-        urbc_runtime_fail(urbc_runtime_current(), "%s", err);
+    if (urbc_ffi_descriptor_cache_get(rt, (const char *)sigv.p, &desc,
+                                      err, sizeof(err)) != URBC_OK) {
+        urbc_runtime_fail(rt, "%s", err);
+        return;
+    }
+    if (urbc_ffi_make_callback_desc(rt, desc, callablev,
+                                    &fn_ptr, err, sizeof(err)) != URBC_OK) {
+        urbc_runtime_fail(rt, "%s", err);
         return;
     }
     urb_push(stack, (Value){ .p = fn_ptr });

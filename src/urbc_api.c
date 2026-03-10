@@ -110,6 +110,15 @@ UrbcStatus urbc_ffi_bind(UrbcRuntime *rt,
     return urbc_ffi_bind_handle(rt, fn_ptr, sig, out_bound, err, err_cap);
 }
 
+UrbcStatus urbc_ffi_bind_desc(UrbcRuntime *rt,
+                              void *fn_ptr,
+                              const UrbcFfiDescriptor *desc,
+                              void **out_bound,
+                              char *err, size_t err_cap)
+{
+    return urbc_ffi_bind_handle_desc(rt, fn_ptr, desc, out_bound, err, err_cap);
+}
+
 UrbcStatus urbc_ffi_call(UrbcRuntime *rt,
                          void *bound_handle,
                          int argc,
@@ -129,6 +138,15 @@ UrbcStatus urbc_ffi_callback(UrbcRuntime *rt,
                              char *err, size_t err_cap)
 {
     return urbc_ffi_make_callback(rt, sig, callable, out_fn_ptr, err, err_cap);
+}
+
+UrbcStatus urbc_ffi_callback_desc(UrbcRuntime *rt,
+                                  const UrbcFfiDescriptor *desc,
+                                  Value callable,
+                                  void **out_fn_ptr,
+                                  char *err, size_t err_cap)
+{
+    return urbc_ffi_make_callback_desc(rt, desc, callable, out_fn_ptr, err, err_cap);
 }
 
 int urbc_ffi_errno_value(void)

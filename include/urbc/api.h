@@ -1,6 +1,7 @@
 #ifndef URBC_API_H
 #define URBC_API_H 1
 
+#include "urbc/ffi_sig.h"
 #include "urbc/runtime.h"
 
 #ifdef __cplusplus
@@ -15,6 +16,8 @@ typedef enum UrbcDlOpenFlags {
     URBC_DLOPEN_NODELETE = 1 << 4,
     URBC_DLOPEN_NOLOAD   = 1 << 5,
 } UrbcDlOpenFlags;
+
+typedef struct UrbcFfiDescriptor UrbcFfiDescriptor;
 
 UrbcStatus urbc_host_call(UrbcRuntime *rt,
                           const char *name,
@@ -35,11 +38,23 @@ UrbcStatus urbc_ffi_sym(void *handle,
 UrbcStatus urbc_ffi_sym_self(const char *name,
                              void **out_symbol,
                              char *err, size_t err_cap);
+UrbcStatus urbc_ffi_describe(const char *sig,
+                             UrbcFfiDescriptor **out_desc,
+                             char *err, size_t err_cap);
+void urbc_ffi_descriptor_release(UrbcFfiDescriptor *desc);
+UrbcStatus urbc_ffi_descriptor_copy_parsed(const UrbcFfiDescriptor *desc,
+                                           FsigParsed *out_sig,
+                                           char *err, size_t err_cap);
 UrbcStatus urbc_ffi_bind(UrbcRuntime *rt,
                          void *fn_ptr,
                          const char *sig,
                          void **out_bound,
                          char *err, size_t err_cap);
+UrbcStatus urbc_ffi_bind_desc(UrbcRuntime *rt,
+                              void *fn_ptr,
+                              const UrbcFfiDescriptor *desc,
+                              void **out_bound,
+                              char *err, size_t err_cap);
 UrbcStatus urbc_ffi_call(UrbcRuntime *rt,
                          void *bound_handle,
                          int argc,
@@ -52,6 +67,11 @@ UrbcStatus urbc_ffi_callback(UrbcRuntime *rt,
                              Value callable,
                              void **out_fn_ptr,
                              char *err, size_t err_cap);
+UrbcStatus urbc_ffi_callback_desc(UrbcRuntime *rt,
+                                  const UrbcFfiDescriptor *desc,
+                                  Value callable,
+                                  void **out_fn_ptr,
+                                  char *err, size_t err_cap);
 int urbc_ffi_errno_value(void);
 UrbcStatus urbc_ffi_dlerror_copy(UrbcRuntime *rt,
                                  char **out_message,

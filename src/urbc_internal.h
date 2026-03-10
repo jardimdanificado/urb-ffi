@@ -109,11 +109,19 @@ Value urbc_host_invoke(UrbcRuntime *rt, UrbcHostBinding *binding, int argc, cons
 void urbc_ffi_cleanup_runtime(UrbcRuntime *rt);
 UrbcStatus urbc_ffi_bind_handle(UrbcRuntime *rt, void *fn_ptr, const char *sig,
                                 void **out_handle, char *err, size_t err_cap);
+UrbcStatus urbc_ffi_bind_handle_desc(UrbcRuntime *rt, void *fn_ptr,
+                                     const UrbcFfiDescriptor *desc,
+                                     void **out_handle, char *err, size_t err_cap);
 UrbcStatus urbc_ffi_call_bound(UrbcRuntime *rt, void *bound_handle, int argc,
                                const Value *argv, const uint8_t *vararg_types,
                                Value *out, char *err, size_t err_cap);
 UrbcStatus urbc_ffi_make_callback(UrbcRuntime *rt, const char *sig, Value callable,
                                   void **out_fn_ptr, char *err, size_t err_cap);
+UrbcStatus urbc_ffi_make_callback_desc(UrbcRuntime *rt,
+                                       const UrbcFfiDescriptor *desc,
+                                       Value callable,
+                                       void **out_fn_ptr,
+                                       char *err, size_t err_cap);
 UrbcStatus urbc_view_make_handle(UrbcRuntime *rt, Value schema_value, uintptr_t base_ptr,
                                  Value *out_view, char *err, size_t err_cap);
 UrbcStatus urbc_view_array_handle(UrbcRuntime *rt, Value schema_value, uintptr_t base_ptr,

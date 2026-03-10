@@ -57,7 +57,7 @@ LDFLAGS ?= -shared -fPIC -pthread
 LDLIBS ?= $(LUA_LIBS) $(FFI_LIBS) -ldl -lm
 
 TARGET = $(DIST_DIR)/urb_ffi_native.so
-OBJS = $(DIST_DIR)/urb_ffi_lua.o $(DIST_DIR)/ffi_sig.o
+OBJS = $(DIST_DIR)/urb_ffi_lua.o
 
 .PHONY: all clean test
 
@@ -67,10 +67,6 @@ $(AMALGAMATED_HEADER) $(AMALGAMATED_CLI): $(AMALGAMATE_INPUTS)
 	$(AMALGAMATE)
 
 $(DIST_DIR)/urb_ffi_lua.o: src/urb_ffi_lua.c $(AMALGAMATED_HEADER) | $(DIST_DIR)/
-	@echo "[CC] $<"
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
-
-$(DIST_DIR)/ffi_sig.o: $(ROOT)/bindings/node/src/ffi_sig.c $(ROOT)/bindings/node/src/ffi_sig.h | $(DIST_DIR)/
 	@echo "[CC] $<"
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
@@ -90,6 +86,7 @@ test: all
 		exit 1; \
 	fi
 	@echo "=== lua hello ===" && $(LUA_BIN) examples/hello.lua
+	@echo "=== lua manual_types ===" && $(LUA_BIN) examples/manual_types.lua
 	@echo "=== lua memory ===" && $(LUA_BIN) examples/memory.lua
 	@echo "=== lua view ===" && $(LUA_BIN) examples/view.lua
 	@echo "=== lua callback ===" && $(LUA_BIN) examples/callback.lua

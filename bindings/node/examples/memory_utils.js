@@ -45,7 +45,8 @@ console.log('readArray f64:', fvals.map(v => v.toFixed(4)));
 
 // ffi.errno
 const libc = ffi.open('libc.so.6');
-const strtol = ffi.bind(ffi.sym(libc, 'strtol'), 'i64 strtol(cstring, pointer, i32)');
+const strtolDesc = ffi.describe('i64 strtol(cstring, pointer, i32)');
+const strtol = ffi.bind(ffi.sym(libc, 'strtol'), strtolDesc);
 strtol('not_a_number', mem.nullptr(), 10n);
 console.log('errno after strtol:', ffi.errno());
 ffi.close(libc);

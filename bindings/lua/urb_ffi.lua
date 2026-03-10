@@ -2,13 +2,29 @@ local function dirname(path)
     return path:match("^(.*)/[^/]+$") or "."
 end
 
+local function normalize_path(path)
+    -- Simple normalization: resolve ".." components
+    local parts = {}
+    for part in path:gmatch("[^/]+") do
+        if part == ".." and #parts > 0 and parts[#parts] ~= ".." then
+            table.remove(parts)
+        elseif part ~= "." then
+            table.insert(parts, part)
+        end
+    end
+    if #parts == 0 then
+        return "."
+    end
+    return table.concat(parts, "/")
+end
+
 local function module_dir()
     local source = debug.getinfo(1, "S").source
     if source:sub(1, 1) ~= "@" then
         error("urb_ffi.lua must be loaded from a file", 2)
     end
     local file = source:sub(2)
-    return dirname(file)
+    return normalize_path(dirname(file))
 end
 
 local function load_native()
@@ -16,6 +32,7 @@ local function load_native()
     local candidates = {
         lua_dir .. "/urb_ffi_native.so",
         dirname(dirname(lua_dir)) .. "/dist/urb_ffi_native.so",
+        lua_dir .. "/../../dist/urb_ffi_native.so",  -- For bindings/lua location
     }
 
     for _, so_path in ipairs(candidates) do
@@ -344,8 +361,475 @@ create_view = function(ptr, schema_meta)
     })
 end
 
+local function make_abi_type(kind, props)
+    local out = { __ffi_abi_type = true, kind = kind }
+    if props then
+        for k, v in pairs(props) do
+            out[k] = v
+        end
+    end
+    return out
+end
+
+local function is_abi_type(value)
+    return type(value) == "table" and value.__ffi_abi_type == true
+end
+
+local function is_ffi_descriptor(value)
+    return type(value) == "table" and value.__ffi_descriptor == true
+end
+
+local function sanitize_abi_name(name)
+    local text = tostring(name or "fn")
+    text = text:gsub("^%s+", ""):gsub("%s+$", "")
+    local safe = text:gsub("[^%w_]", "_")
+    if safe == "" then safe = "fn_anon" end
+    if not safe:match("^[A-Za-z_]") then
+        safe = "fn_" .. safe
+    end
+    return safe
+end
+
+local function normalize_abi_type(value, what)
+    what = what or "type"
+    if is_abi_type(value) then
+        return value
+    end
+    if type(value) == "string" then
+        local text = value:match("^%s*(.-)%s*$")
+        if text == "void" then
+            return make_abi_type("void")
+        end
+        local normalized = normalize_type(text)
+        if normalized == "pointer" then
+            return make_abi_type("pointer", { to = nil })
+        end
+        if normalized == "cstring" then
+            return make_abi_type("cstring")
+        end
+        return make_abi_type("primitive", { name = normalized })
+    end
+    error(what .. " must be a type string or ffi.type.* descriptor", 3)
+end
+
+local function normalize_abi_field_entries(fields, what)
+    what = what or "fields"
+    if type(fields) ~= "table" then
+        error(what .. " must be a table", 3)
+    end
+
+    local out = {}
+    local max_index = 0
+    for k in pairs(fields) do
+        if type(k) == "number" and k > max_index then
+            max_index = k
+        end
+    end
+
+    if max_index > 0 then
+        for i = 1, max_index do
+            local entry = fields[i]
+            if type(entry) == "table" and entry.name ~= nil then
+                if type(entry.name) ~= "string" or entry.name == "" then
+                    error(what .. "[" .. i .. "] must have a non-empty name", 3)
+                end
+                out[#out + 1] = {
+                    name = entry.name,
+                    type = normalize_abi_type(entry.type, what .. "[" .. i .. "] type"),
+                }
+            elseif type(entry) == "table" and #entry == 2 then
+                out[#out + 1] = {
+                    name = tostring(entry[1]),
+                    type = normalize_abi_type(entry[2], what .. "[" .. i .. "] type"),
+                }
+            else
+                error(what .. "[" .. i .. "] must be { name = ..., type = ... } or { name, type }", 3)
+            end
+        end
+        return out
+    end
+
+    for name, field_type in pairs(fields) do
+        out[#out + 1] = {
+            name = tostring(name),
+            type = normalize_abi_type(field_type, what .. "." .. tostring(name)),
+        }
+    end
+    table.sort(out, function(a, b) return a.name < b.name end)
+    return out
+end
+
+local abi_type_to_string
+
+local function abi_function_to_string(fn_type)
+    local prefix = ""
+    if fn_type.abi and fn_type.abi ~= "default" then
+        prefix = "abi(" .. fn_type.abi .. ") "
+    end
+    local args = {}
+    for i = 1, #fn_type.args do
+        args[#args + 1] = abi_type_to_string(fn_type.args[i])
+    end
+    if fn_type.varargs then
+        args[#args + 1] = "..."
+    end
+    return prefix .. abi_type_to_string(fn_type.ret) .. " " .. sanitize_abi_name(fn_type.name) .. "(" .. table.concat(args, ", ") .. ")"
+end
+
+abi_type_to_string = function(value)
+    local abi_type = normalize_abi_type(value)
+    if abi_type.kind == "void" then
+        return "void"
+    elseif abi_type.kind == "primitive" then
+        return abi_type.name
+    elseif abi_type.kind == "cstring" then
+        return "cstring"
+    elseif abi_type.kind == "pointer" then
+        if abi_type.to ~= nil then
+            return "pointer(" .. abi_type_to_string(abi_type.to) .. ")"
+        end
+        return "pointer"
+    elseif abi_type.kind == "array" then
+        return "array(" .. abi_type_to_string(abi_type.element) .. ", " .. tostring(abi_type.length) .. ")"
+    elseif abi_type.kind == "struct" or abi_type.kind == "union" then
+        local parts = {}
+        for i = 1, #abi_type.fields do
+            local field = abi_type.fields[i]
+            parts[#parts + 1] = field.name .. ": " .. abi_type_to_string(field.type)
+        end
+        return abi_type.kind .. "(" .. table.concat(parts, ", ") .. ")"
+    elseif abi_type.kind == "enum" then
+        return "enum(" .. abi_type_to_string(abi_type.underlying) .. ")"
+    elseif abi_type.kind == "function" then
+        return abi_function_to_string(abi_type)
+    end
+    error("unsupported ABI type kind: " .. tostring(abi_type.kind), 2)
+end
+
+local function abi_type_to_native_leaf(value)
+    local abi_type = normalize_abi_type(value)
+    if abi_type.kind == "void" then
+        return "void"
+    elseif abi_type.kind == "primitive" then
+        return abi_type.name
+    elseif abi_type.kind == "cstring" then
+        return "cstring"
+    elseif abi_type.kind == "pointer" then
+        return "pointer"
+    elseif abi_type.kind == "enum" then
+        return abi_type_to_native_leaf(abi_type.underlying)
+    end
+    return nil
+end
+
+local function abi_function_to_native_signature(fn_type)
+    if fn_type.abi and fn_type.abi ~= "default" then
+        return nil
+    end
+    local ret = abi_type_to_native_leaf(fn_type.ret)
+    if not ret then return nil end
+    local args = {}
+    for i = 1, #fn_type.args do
+        local arg = abi_type_to_native_leaf(fn_type.args[i])
+        if not arg then return nil end
+        args[#args + 1] = arg
+    end
+    if fn_type.varargs then
+        args[#args + 1] = "..."
+    end
+    return ret .. " " .. sanitize_abi_name(fn_type.name) .. "(" .. table.concat(args, ", ") .. ")"
+end
+
+local function create_ffi_descriptor(sig, handle, abi_type, native_sig)
+    return {
+        __ffi_descriptor = true,
+        handle = handle,
+        sig = tostring(sig),
+        type = abi_type,
+        native_sig = native_sig or tostring(sig),
+        native_capable = handle ~= nil,
+    }
+end
+
+local function describe_function_type(fn_type)
+    local sig = abi_function_to_string(fn_type)
+    local native_sig = abi_function_to_native_signature(fn_type)
+    local handle = native_sig and native.describe(native_sig) or nil
+    return create_ffi_descriptor(sig, handle, fn_type, native_sig or sig)
+end
+
+local function ensure_ffi_descriptor(value, context)
+    context = context or "ffi"
+    if is_ffi_descriptor(value) then
+        return value
+    end
+    if type(value) == "string" then
+        local text = tostring(value)
+        return create_ffi_descriptor(text, native.describe(text), nil, text)
+    end
+    if is_abi_type(value) and value.kind == "function" then
+        return describe_function_type(value)
+    end
+    error(context .. " expects a signature string, ffi.type.func(...), or descriptor", 3)
+end
+
+local function abi_type_to_layout_schema(value)
+    local abi_type = normalize_abi_type(value)
+    if abi_type.kind == "primitive" then
+        return abi_type.name
+    elseif abi_type.kind == "cstring" then
+        return "cstring"
+    elseif abi_type.kind == "pointer" or abi_type.kind == "function" then
+        return { __pointer = true }
+    elseif abi_type.kind == "enum" then
+        return abi_type_to_layout_schema(abi_type.underlying)
+    elseif abi_type.kind == "array" then
+        local element = abi_type_to_layout_schema(abi_type.element)
+        if type(element) ~= "string" then
+            error("only arrays of scalar/pointer-compatible elements are layout-compatible in this binding", 3)
+        end
+        return { element, abi_type.length }
+    elseif abi_type.kind == "struct" or abi_type.kind == "union" then
+        local schema = abi_type.kind == "union" and { __union = true } or {}
+        for i = 1, #abi_type.fields do
+            local field = abi_type.fields[i]
+            schema[field.name] = abi_type_to_layout_schema(field.type)
+        end
+        return schema
+    end
+    error("type " .. abi_type_to_string(abi_type) .. " cannot be converted to a memory layout", 3)
+end
+
+local function abi_type_size(value)
+    local abi_type = normalize_abi_type(value)
+    if abi_type.kind == "void" then
+        return 0
+    elseif abi_type.kind == "primitive" then
+        return TYPE_INFO[abi_type.name].size
+    elseif abi_type.kind == "cstring" or abi_type.kind == "pointer" or abi_type.kind == "function" then
+        return PTR_SIZE
+    elseif abi_type.kind == "enum" then
+        return abi_type_size(abi_type.underlying)
+    elseif abi_type.kind == "array" then
+        return abi_type_size(abi_type.element) * abi_type.length
+    elseif abi_type.kind == "struct" or abi_type.kind == "union" then
+        return compile_schema(abi_type_to_layout_schema(abi_type)).size
+    end
+    error("unsupported ABI type kind: " .. tostring(abi_type.kind), 3)
+end
+
+local function normalize_global_type(value)
+    if is_ffi_descriptor(value) then
+        if not value.type then
+            error("ffi.global requires a type descriptor or a manual function descriptor", 3)
+        end
+        if value.type.kind == "function" then
+            return make_abi_type("pointer", { to = value.type })
+        end
+        return value.type
+    end
+    local abi_type = normalize_abi_type(value, "global type")
+    if abi_type.kind == "function" then
+        return make_abi_type("pointer", { to = abi_type })
+    end
+    return abi_type
+end
+
+local function read_abi_value(ptr, value)
+    local abi_type = normalize_abi_type(value)
+    if abi_type.kind == "primitive" then
+        return read_primitive(ptr, abi_type.name)
+    elseif abi_type.kind == "enum" then
+        return read_abi_value(ptr, abi_type.underlying)
+    elseif abi_type.kind == "cstring" or abi_type.kind == "pointer" or abi_type.kind == "function" then
+        return native.readptr(ptr)
+    end
+    error("ffi.global cannot read " .. abi_type_to_string(abi_type) .. " directly", 3)
+end
+
+local function write_abi_value(ptr, abi_type_value, value)
+    local abi_type = normalize_abi_type(abi_type_value)
+    if abi_type.kind == "primitive" then
+        write_primitive(ptr, abi_type.name, value)
+        return
+    elseif abi_type.kind == "enum" then
+        write_abi_value(ptr, abi_type.underlying, value)
+        return
+    elseif abi_type.kind == "cstring" or abi_type.kind == "pointer" or abi_type.kind == "function" then
+        native.writeptr(ptr, value)
+        return
+    end
+    error("ffi.global cannot write " .. abi_type_to_string(abi_type) .. " directly", 3)
+end
+
+local function create_scalar_global(ptr, abi_type_value)
+    local abi_type = normalize_abi_type(abi_type_value)
+    return setmetatable({ ptr = ptr, type = abi_type }, {
+        __index = function(self, key)
+            if key == "ptr" then return ptr end
+            if key == "type" then return abi_type end
+            if key == "value" then return read_abi_value(ptr, abi_type) end
+            if key == "read" then
+                return function()
+                    return read_abi_value(ptr, abi_type)
+                end
+            end
+            if key == "write" then
+                return function(_, value)
+                    write_abi_value(ptr, abi_type, value)
+                end
+            end
+            return rawget(self, key)
+        end,
+        __newindex = function(self, key, value)
+            if key == "value" then
+                write_abi_value(ptr, abi_type, value)
+                return
+            end
+            rawset(self, key, value)
+        end,
+    })
+end
+
+local function create_array_global(ptr, abi_type_value)
+    local abi_type = normalize_abi_type(abi_type_value)
+    if abi_type.element.kind == "struct" or abi_type.element.kind == "union" then
+        return create_view_array(ptr, compile_schema(abi_type_to_layout_schema(abi_type.element)), abi_type.length)
+    end
+    local stride = abi_type_size(abi_type.element)
+    return setmetatable({ ptr = ptr, len = abi_type.length, count = abi_type.length }, {
+        __index = function(self, key)
+            if key == "ptr" then return ptr end
+            if key == "len" or key == "count" or key == "length" then return abi_type.length end
+            if key == "to_array" then
+                return function()
+                    local out = {}
+                    for i = 1, abi_type.length do
+                        out[i] = read_abi_value(ptr + (i - 1) * stride, abi_type.element)
+                    end
+                    return out
+                end
+            end
+            if type(key) == "number" and key >= 1 and key <= abi_type.length and key % 1 == 0 then
+                return read_abi_value(ptr + (key - 1) * stride, abi_type.element)
+            end
+            return rawget(self, key)
+        end,
+        __newindex = function(self, key, value)
+            if type(key) == "number" and key >= 1 and key <= abi_type.length and key % 1 == 0 then
+                write_abi_value(ptr + (key - 1) * stride, abi_type.element, value)
+                return
+            end
+            rawset(self, key, value)
+        end,
+    })
+end
+
+local ffi_type = {}
+
+function ffi_type.primitive(name)
+    return normalize_abi_type(name, "primitive type")
+end
+
+function ffi_type.void()
+    return make_abi_type("void")
+end
+
+function ffi_type.cstring()
+    return make_abi_type("cstring")
+end
+
+function ffi_type.pointer(to)
+    if to == nil then
+        return make_abi_type("pointer", { to = nil })
+    end
+    return make_abi_type("pointer", { to = normalize_abi_type(to, "pointer target") })
+end
+
+function ffi_type.array(element, length)
+    local count = to_non_negative_int(length, "array length")
+    if count <= 0 then
+        error("array length must be greater than zero", 2)
+    end
+    return make_abi_type("array", {
+        element = normalize_abi_type(element, "array element"),
+        length = count,
+    })
+end
+
+function ffi_type.struct(fields, options)
+    options = options or {}
+    return make_abi_type("struct", {
+        name = options.name and tostring(options.name) or nil,
+        fields = normalize_abi_field_entries(fields, "struct fields"),
+    })
+end
+
+function ffi_type.union(fields, options)
+    options = options or {}
+    return make_abi_type("union", {
+        name = options.name and tostring(options.name) or nil,
+        fields = normalize_abi_field_entries(fields, "union fields"),
+    })
+end
+
+function ffi_type.enum(values, options)
+    options = options or {}
+    return make_abi_type("enum", {
+        values = type(values) == "table" and values or {},
+        underlying = normalize_abi_type(options.underlying or options.base or "i32", "enum underlying type"),
+    })
+end
+
+function ffi_type.func(ret, args, options)
+    options = options or {}
+    args = args or {}
+    if type(args) ~= "table" then
+        error("ffi.type.func args must be a table", 2)
+    end
+    local arg_types = {}
+    for i = 1, #args do
+        arg_types[i] = normalize_abi_type(args[i], "function arg " .. i)
+    end
+    return make_abi_type("function", {
+        name = sanitize_abi_name(options.name or "fn"),
+        abi = options.abi and tostring(options.abi) or "default",
+        varargs = not not options.varargs,
+        ret = normalize_abi_type(ret, "function return type"),
+        args = arg_types,
+    })
+end
+
+function ffi_type.layout(abi_type_value)
+    return abi_type_to_layout_schema(normalize_abi_type(abi_type_value))
+end
+
+function ffi_type.sizeof(abi_type_value)
+    return abi_type_size(abi_type_value)
+end
+
+function ffi_type.offsetof(abi_type_value, field_name)
+    local abi_type = normalize_abi_type(abi_type_value)
+    if abi_type.kind ~= "struct" and abi_type.kind ~= "union" then
+        error("ffi.type.offsetof expects a struct or union type", 2)
+    end
+    local meta = compile_schema(abi_type_to_layout_schema(abi_type))
+    local field = meta.field_map[tostring(field_name)]
+    if not field then
+        error("field not found: " .. tostring(field_name), 2)
+    end
+    return field.offset
+end
+
+for _, name in ipairs({ "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64" }) do
+    ffi_type[name] = function()
+        return make_abi_type("primitive", { name = name })
+    end
+end
+
 local ffi = {
     flags = native.dlopen_flags,
+    type = ffi_type,
 }
 
 function ffi.open(path, flags)
@@ -366,17 +850,44 @@ function ffi.sym_self(name)
     return native.sym_self(tostring(name))
 end
 
-function ffi.bind(ptr, sig)
-    local handle = native.bind(ptr, tostring(sig))
-    return setmetatable({ handle = handle, sig = tostring(sig) }, {
+function ffi.describe(sig)
+    return ensure_ffi_descriptor(sig, "ffi.describe")
+end
+
+function ffi.bind(ptr, descriptor)
+    local desc = ensure_ffi_descriptor(descriptor, "ffi.bind")
+    if desc.handle == nil then
+        error("ffi.bind descriptor is not natively callable yet: " .. tostring(desc.sig), 2)
+    end
+    local handle = native.bind(ptr, desc.handle)
+    return setmetatable({ handle = handle, sig = tostring(desc.sig or ""), descriptor = desc }, {
         __call = function(self, ...)
             return native.call_bound(self.handle, { ... })
         end,
     })
 end
 
-function ffi.callback(sig, fn)
-    return native.callback(tostring(sig), fn)
+function ffi.callback(descriptor, fn)
+    local desc = ensure_ffi_descriptor(descriptor, "ffi.callback")
+    if desc.handle == nil then
+        error("ffi.callback descriptor is not natively callable yet: " .. tostring(desc.sig), 2)
+    end
+    local result = native.callback(desc.handle, fn)
+    if type(result) == "table" then
+        result.sig = tostring(desc.sig or "")
+    end
+    return result
+end
+
+function ffi.global(ptr, descriptor)
+    local abi_type = normalize_global_type(descriptor)
+    if abi_type.kind == "struct" or abi_type.kind == "union" then
+        return create_view(ptr, compile_schema(abi_type_to_layout_schema(abi_type)))
+    end
+    if abi_type.kind == "array" then
+        return create_array_global(ptr, abi_type)
+    end
+    return create_scalar_global(ptr, abi_type)
 end
 
 function ffi.errno()

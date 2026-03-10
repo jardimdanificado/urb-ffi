@@ -201,6 +201,436 @@ function compileSchema(schema) {
 	}
 }
 
+function makeAbiType(kind, props = {}) {
+	return Object.freeze({ __ffiAbiType: true, kind, ...props });
+}
+
+function isAbiType(value) {
+	return !!value && typeof value === 'object' && value.__ffiAbiType === true;
+}
+
+function isFfiDescriptor(value) {
+	return !!value && typeof value === 'object' && value.__ffiDescriptor === true;
+}
+
+function sanitizeAbiName(name) {
+	const text = String(name || 'fn').trim();
+	const safe = text.replace(/[^A-Za-z0-9_]/g, '_');
+	return safe && /^[A-Za-z_]/.test(safe) ? safe : `fn_${safe || 'anon'}`;
+}
+
+function normalizeAbiType(type, what = 'type') {
+	if (isAbiType(type)) {
+		return type;
+	}
+	if (typeof type === 'string') {
+		const text = type.trim();
+		if (text === 'void') return makeAbiType('void');
+		const normalized = normalizeType(text);
+		if (normalized === 'pointer') return makeAbiType('pointer', { to: null });
+		if (normalized === 'cstring') return makeAbiType('cstring');
+		return makeAbiType('primitive', { name: normalized });
+	}
+	throw new TypeError(`${what} must be a type string or ffi.type.* descriptor`);
+}
+
+function normalizeAbiFieldEntries(fields, what) {
+	if (Array.isArray(fields)) {
+		return fields.map((entry, index) => {
+			if (Array.isArray(entry)) {
+				if (entry.length !== 2) {
+					throw new TypeError(`${what}[${index}] must be [name, type]`);
+				}
+				return {
+					name: String(entry[0]),
+					type: normalizeAbiType(entry[1], `${what}[${index}] type`),
+				};
+			}
+			if (!entry || typeof entry !== 'object') {
+				throw new TypeError(`${what}[${index}] must be an object or [name, type] tuple`);
+			}
+			if (typeof entry.name !== 'string' || !entry.name) {
+				throw new TypeError(`${what}[${index}] must have a non-empty name`);
+			}
+			return {
+				name: entry.name,
+				type: normalizeAbiType(entry.type, `${what}[${index}] type`),
+			};
+		});
+	}
+	if (fields && typeof fields === 'object') {
+		return Object.entries(fields).map(([name, type]) => ({
+			name,
+			type: normalizeAbiType(type, `${what}.${name}`),
+		}));
+	}
+	throw new TypeError(`${what} must be an array of fields or a plain object`);
+}
+
+function abiTypeToString(type) {
+	const abiType = normalizeAbiType(type);
+	switch (abiType.kind) {
+	case 'void':
+		return 'void';
+	case 'primitive':
+		return abiType.name;
+	case 'cstring':
+		return 'cstring';
+	case 'pointer':
+		return abiType.to ? `pointer(${abiTypeToString(abiType.to)})` : 'pointer';
+	case 'array':
+		return `array(${abiTypeToString(abiType.element)}, ${abiType.length})`;
+	case 'struct':
+	case 'union':
+		return `${abiType.kind}(${abiType.fields.map((field) => `${field.name}: ${abiTypeToString(field.type)}`).join(', ')})`;
+	case 'enum':
+		return `enum(${abiTypeToString(abiType.underlying)})`;
+	case 'function': {
+		const prefix = abiType.abi && abiType.abi !== 'default' ? `abi(${abiType.abi}) ` : '';
+		const args = abiType.args.map((arg) => abiTypeToString(arg));
+		if (abiType.varargs) args.push('...');
+		return `${prefix}${abiTypeToString(abiType.ret)} ${sanitizeAbiName(abiType.name)}(${args.join(', ')})`;
+	}
+	default:
+		throw new TypeError(`unsupported ABI type kind: ${abiType.kind}`);
+	}
+}
+
+function abiTypeToNativeLeaf(type) {
+	const abiType = normalizeAbiType(type);
+	switch (abiType.kind) {
+	case 'void':
+		return 'void';
+	case 'primitive':
+		return abiType.name;
+	case 'cstring':
+		return 'cstring';
+	case 'pointer':
+		return 'pointer';
+	case 'enum':
+		return abiTypeToNativeLeaf(abiType.underlying);
+	default:
+		return null;
+	}
+}
+
+function abiFunctionToNativeSignature(fnType) {
+	if (fnType.abi && fnType.abi !== 'default') {
+		return null;
+	}
+	const ret = abiTypeToNativeLeaf(fnType.ret);
+	if (!ret) return null;
+	const args = fnType.args.map((arg) => abiTypeToNativeLeaf(arg));
+	if (args.some((arg) => !arg)) return null;
+	const parts = [...args];
+	if (fnType.varargs) parts.push('...');
+	return `${ret} ${sanitizeAbiName(fnType.name)}(${parts.join(', ')})`;
+}
+
+function createFfiDescriptor(sig, handle, type, nativeSig) {
+	const descriptor = {
+		__ffiDescriptor: true,
+		sig: String(sig),
+		type: type || null,
+		nativeSig: nativeSig || String(sig),
+		nativeCapable: Boolean(handle),
+	};
+	if (handle) {
+		Object.defineProperty(descriptor, 'handle', {
+			value: handle,
+			enumerable: false,
+			writable: false,
+			configurable: false,
+		});
+	}
+	return Object.freeze(descriptor);
+}
+
+function describeFunctionType(fnType) {
+	const sig = abiTypeToString(fnType);
+	const nativeSig = abiFunctionToNativeSignature(fnType);
+	const handle = nativeSig ? native.describe(nativeSig) : null;
+	return createFfiDescriptor(sig, handle, fnType, nativeSig || sig);
+}
+
+function ensureFfiDescriptor(value, context) {
+	if (isFfiDescriptor(value)) {
+		return value;
+	}
+	if (typeof value === 'string') {
+		const text = String(value);
+		return createFfiDescriptor(text, native.describe(text), null, text);
+	}
+	if (isAbiType(value) && value.kind === 'function') {
+		return describeFunctionType(value);
+	}
+	throw new TypeError(`${context} expects a signature string, ffi.type.func(...), or descriptor`);
+}
+
+function abiTypeToLayoutSchema(type) {
+	const abiType = normalizeAbiType(type);
+	switch (abiType.kind) {
+	case 'primitive':
+		return abiType.name;
+	case 'cstring':
+		return 'cstring';
+	case 'pointer':
+	case 'function':
+		return { __pointer: true };
+	case 'enum':
+		return abiTypeToLayoutSchema(abiType.underlying);
+	case 'array': {
+		const element = abiTypeToLayoutSchema(abiType.element);
+		if (typeof element !== 'string') {
+			throw new TypeError('only arrays of scalar/pointer-compatible elements are layout-compatible in this binding');
+		}
+		return [element, abiType.length];
+	}
+	case 'struct':
+	case 'union': {
+		const schema = abiType.kind === 'union' ? { __union: true } : {};
+		for (const field of abiType.fields) {
+			schema[field.name] = abiTypeToLayoutSchema(field.type);
+		}
+		return schema;
+	}
+	default:
+		throw new TypeError(`type ${abiTypeToString(abiType)} cannot be converted to a memory layout`);
+	}
+}
+
+function abiTypeSize(type) {
+	const abiType = normalizeAbiType(type);
+	switch (abiType.kind) {
+	case 'void':
+		return 0;
+	case 'primitive':
+		return TYPE_INFO[abiType.name].size;
+	case 'cstring':
+	case 'pointer':
+	case 'function':
+		return PTR_SIZE;
+	case 'enum':
+		return abiTypeSize(abiType.underlying);
+	case 'array':
+		return abiTypeSize(abiType.element) * abiType.length;
+	case 'struct':
+	case 'union':
+		return compileSchema(abiTypeToLayoutSchema(abiType)).size;
+	default:
+		throw new TypeError(`unsupported ABI type kind: ${abiType.kind}`);
+	}
+}
+
+function normalizeGlobalType(value) {
+	if (isFfiDescriptor(value)) {
+		if (!value.type) {
+			throw new TypeError('ffi.global requires a type descriptor or a manual function descriptor');
+		}
+		return value.type.kind === 'function'
+			? makeAbiType('pointer', { to: value.type })
+			: value.type;
+	}
+	const type = normalizeAbiType(value, 'global type');
+	return type.kind === 'function' ? makeAbiType('pointer', { to: type }) : type;
+}
+
+function readAbiValue(ptr, type) {
+	const abiType = normalizeAbiType(type);
+	switch (abiType.kind) {
+	case 'primitive':
+		return readPrimitive(ptr, abiType.name);
+	case 'enum':
+		return readAbiValue(ptr, abiType.underlying);
+	case 'cstring':
+	case 'pointer':
+	case 'function':
+		return native.readptr(ptr);
+	default:
+		throw new TypeError(`ffi.global cannot read ${abiTypeToString(abiType)} directly`);
+	}
+}
+
+function writeAbiValue(ptr, type, value) {
+	const abiType = normalizeAbiType(type);
+	switch (abiType.kind) {
+	case 'primitive':
+		writePrimitive(ptr, abiType.name, value);
+		return;
+	case 'enum':
+		writeAbiValue(ptr, abiType.underlying, value);
+		return;
+	case 'cstring':
+	case 'pointer':
+	case 'function':
+		native.writeptr(ptr, value);
+		return;
+	default:
+		throw new TypeError(`ffi.global cannot write ${abiTypeToString(abiType)} directly`);
+	}
+}
+
+function createScalarGlobal(ptr, type) {
+	const basePtr = BigInt(ptr);
+	const abiType = normalizeAbiType(type);
+	const read = () => readAbiValue(basePtr, abiType);
+	const write = (value) => writeAbiValue(basePtr, abiType, value);
+	return new Proxy({ ptr: basePtr, type: abiType }, {
+		get(target, prop) {
+			if (prop === 'ptr') return basePtr;
+			if (prop === 'type') return abiType;
+			if (prop === 'value') return read();
+			if (prop === 'read') return read;
+			if (prop === 'write') return write;
+			return target[prop];
+		},
+		set(target, prop, value) {
+			if (prop === 'value') {
+				write(value);
+				return true;
+			}
+			target[prop] = value;
+			return true;
+		},
+		has(_, prop) {
+			return prop === 'ptr' || prop === 'type' || prop === 'value' || prop === 'read' || prop === 'write';
+		},
+		ownKeys() {
+			return ['ptr', 'type', 'value'];
+		},
+		getOwnPropertyDescriptor(_, prop) {
+			if (prop === 'ptr' || prop === 'type' || prop === 'value') {
+				return { enumerable: true, configurable: true };
+			}
+			return undefined;
+		},
+	});
+}
+
+function createArrayGlobal(ptr, type) {
+	const basePtr = BigInt(ptr);
+	const abiType = normalizeAbiType(type);
+	const length = abiType.length;
+	if (abiType.element.kind === 'struct' || abiType.element.kind === 'union') {
+		return createViewArray(basePtr, compileSchema(abiTypeToLayoutSchema(abiType.element)), length);
+	}
+	const stride = abiTypeSize(abiType.element);
+	return new Proxy({ ptr: basePtr, length, count: length }, {
+		get(_, prop) {
+			if (prop === 'ptr') return basePtr;
+			if (prop === 'length' || prop === 'count') return length;
+			if (prop === 'toArray') {
+				return () => {
+					const out = new Array(length);
+					for (let i = 0; i < length; i++) {
+						out[i] = readAbiValue(basePtr + BigInt(i * stride), abiType.element);
+					}
+					return out;
+				};
+			}
+			if (!isArrayIndex(prop)) return undefined;
+			const index = Number(prop);
+			if (index >= length) return undefined;
+			return readAbiValue(basePtr + BigInt(index * stride), abiType.element);
+		},
+		set(_, prop, value) {
+			if (!isArrayIndex(prop)) return false;
+			const index = Number(prop);
+			if (index >= length) return false;
+			writeAbiValue(basePtr + BigInt(index * stride), abiType.element, value);
+			return true;
+		},
+		has(_, prop) {
+			if (prop === 'ptr' || prop === 'length' || prop === 'count') return true;
+			return isArrayIndex(prop) && Number(prop) < length;
+		},
+		ownKeys() {
+			const keys = ['ptr', 'length', 'count'];
+			for (let i = 0; i < length; i++) keys.push(String(i));
+			return keys;
+		},
+		getOwnPropertyDescriptor(_, prop) {
+			if (prop === 'ptr' || prop === 'length' || prop === 'count') {
+				return { enumerable: true, configurable: true };
+			}
+			if (isArrayIndex(prop) && Number(prop) < length) {
+				return { enumerable: true, configurable: true };
+			}
+			return undefined;
+		},
+	});
+}
+
+const ffiType = {
+	primitive(name) {
+		return normalizeAbiType(name, 'primitive type');
+	},
+	void() {
+		return makeAbiType('void');
+	},
+	cstring() {
+		return makeAbiType('cstring');
+	},
+	pointer(to = null) {
+		return makeAbiType('pointer', { to: to == null ? null : normalizeAbiType(to, 'pointer target') });
+	},
+	array(element, length) {
+		const count = toNonNegativeInt(length, 'array length');
+		if (count <= 0) throw new TypeError('array length must be greater than zero');
+		return makeAbiType('array', { element: normalizeAbiType(element, 'array element'), length: count });
+	},
+	struct(fields, options = {}) {
+		return makeAbiType('struct', {
+			name: options.name ? String(options.name) : null,
+			fields: normalizeAbiFieldEntries(fields, 'struct fields'),
+		});
+	},
+	union(fields, options = {}) {
+		return makeAbiType('union', {
+			name: options.name ? String(options.name) : null,
+			fields: normalizeAbiFieldEntries(fields, 'union fields'),
+		});
+	},
+	enum(values = {}, options = {}) {
+		return makeAbiType('enum', {
+			values: values && typeof values === 'object' ? { ...values } : {},
+			underlying: normalizeAbiType(options.underlying || options.base || 'i32', 'enum underlying type'),
+		});
+	},
+	func(ret, args = [], options = {}) {
+		if (!Array.isArray(args)) throw new TypeError('ffi.type.func args must be an array');
+		return makeAbiType('function', {
+			name: sanitizeAbiName(options.name || 'fn'),
+			abi: options.abi ? String(options.abi) : 'default',
+			varargs: Boolean(options.varargs),
+			ret: normalizeAbiType(ret, 'function return type'),
+			args: args.map((arg, index) => normalizeAbiType(arg, `function arg ${index}`)),
+		});
+	},
+	layout(type) {
+		return abiTypeToLayoutSchema(normalizeAbiType(type));
+	},
+	sizeof(type) {
+		return abiTypeSize(type);
+	},
+	offsetof(type, fieldName) {
+		const abiType = normalizeAbiType(type);
+		if (abiType.kind !== 'struct' && abiType.kind !== 'union') {
+			throw new TypeError('ffi.type.offsetof expects a struct or union type');
+		}
+		const meta = compileSchema(abiTypeToLayoutSchema(abiType));
+		const field = meta.fieldMap.get(String(fieldName));
+		if (!field) {
+			throw new Error(`field not found: ${fieldName}`);
+		}
+		return field.offset;
+	},
+};
+
+for (const name of ['bool', 'i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'i64', 'u64', 'f32', 'f64']) {
+	ffiType[name] = () => makeAbiType('primitive', { name });
+}
+
 function isArrayIndex(prop) {
 	return typeof prop === 'string' && /^(0|[1-9]\d*)$/.test(prop);
 }
@@ -374,6 +804,10 @@ function createViewArray(ptr, schemaMeta, count) {
 
 const ffi = {
 	flags: native.dlopenFlags,
+	type: ffiType,
+	describe(sig) {
+		return ensureFfiDescriptor(sig, 'ffi.describe');
+	},
 	open(path, flags = 0) {
 		return native.open(String(path), flags);
 	},
@@ -386,17 +820,26 @@ const ffi = {
 	sym_self(name) {
 		return native.symSelf(String(name));
 	},
-	bind(ptr, sig) {
-		const handle = native.bind(ptr, String(sig));
+	bind(ptr, descriptor) {
+		const desc = ensureFfiDescriptor(descriptor, 'ffi.bind');
+		if (!desc.handle) {
+			throw new TypeError(`ffi.bind descriptor is not natively callable yet: ${desc.sig}`);
+		}
+		const handle = native.bind(ptr, desc.handle);
 		const fn = (...args) => native.callBound(handle, args);
 		Object.defineProperties(fn, {
 			handle: { value: handle, enumerable: false },
-			sig: { value: String(sig), enumerable: true },
+			sig: { value: String(desc.sig || ''), enumerable: true },
+			descriptor: { value: desc, enumerable: false },
 		});
 		return fn;
 	},
-	callback(sig, fn) {
-		const result = native.callback(String(sig), fn);
+	callback(descriptor, fn) {
+		const desc = ensureFfiDescriptor(descriptor, 'ffi.callback');
+		if (!desc.handle) {
+			throw new TypeError(`ffi.callback descriptor is not natively callable yet: ${desc.sig}`);
+		}
+		const result = native.callback(desc.handle, fn);
 		if (result && Object.prototype.hasOwnProperty.call(result, 'handle')) {
 			Object.defineProperty(result, 'handle', {
 				value: result.handle,
@@ -405,7 +848,25 @@ const ffi = {
 				configurable: false,
 			});
 		}
+		if (result && typeof result === 'object') {
+			Object.defineProperty(result, 'sig', {
+				value: String(desc.sig || ''),
+				enumerable: true,
+				writable: false,
+				configurable: false,
+			});
+		}
 		return result;
+	},
+	global(ptr, descriptor) {
+		const type = normalizeGlobalType(descriptor);
+		if (type.kind === 'struct' || type.kind === 'union') {
+			return createView(ptr, compileSchema(abiTypeToLayoutSchema(type)));
+		}
+		if (type.kind === 'array') {
+			return createArrayGlobal(ptr, type);
+		}
+		return createScalarGlobal(ptr, type);
 	},
 	errno() {
 		return native.errnoValue();

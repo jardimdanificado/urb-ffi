@@ -40,7 +40,8 @@ for (let i = 0; i < n; i++) console.log(`pts[${i}].x =`, pts2[i].x);
 const libc = ffi.open('libc.so.6');
 const ClockSchema = { tv_sec: 'i64', tv_nsec: 'i64' };
 const clock_ptr = mem.alloc(BigInt(mem.struct_sizeof(ClockSchema)));
-const clockgettime = ffi.bind(ffi.sym(libc, 'clock_gettime'), 'i32 clock_gettime(i32, pointer)');
+const clockgettimeDesc = ffi.describe('i32 clock_gettime(i32, pointer)');
+const clockgettime = ffi.bind(ffi.sym(libc, 'clock_gettime'), clockgettimeDesc);
 clockgettime(0, clock_ptr);  // CLOCK_REALTIME = 0
 const ts = mem.view(clock_ptr, ClockSchema);
 console.log('tv_nsec =', ts.tv_nsec);

@@ -81,6 +81,7 @@ clean:
 
 test: all
 	@echo "=== hello ===" && $(NODE) examples/hello.js
+	@echo "=== manual_types ===" && $(NODE) examples/manual_types.js
 	@echo "=== memory ===" && $(NODE) examples/memory.js
 	@echo "=== view ===" && $(NODE) examples/view.js
 	@echo "=== callback ===" && $(NODE) examples/callback.js

@@ -62,10 +62,5 @@ clean:
 	rm -rf build/
 
 test: all
-	@echo "=== hello ===" && $(NODE) examples/hello.js
-	@echo "=== memory ===" && $(NODE) examples/memory.js
-	@echo "=== view ===" && $(NODE) examples/view.js
-	@echo "=== callback ===" && $(NODE) examples/callback.js
-	@echo "=== meta_fields ===" && $(NODE) examples/meta_fields.js
-	@echo "=== memory_utils ===" && $(NODE) examples/memory_utils.js
-	@echo "=== sym_self ===" && $(NODE) examples/sym_self.js
+	@echo "=== disturb addon smoke ===" && $(NODE) -e "const ffi=require('./build/disturb.node'); if(!ffi||typeof ffi.bind!=='function'||typeof ffi.callback!=='function'||typeof ffi.alloc!=='function') throw new Error('missing exports'); console.log('exports ok');"
+	@echo "=== disturb addon memory io ===" && $(NODE) -e "const ffi=require('./build/disturb.node'); const p=ffi.alloc(16); ffi.writei32(p, 123); const v=ffi.readi32(p); ffi.free(p); if(v!==123) throw new Error('memory io failed: '+v); console.log('memory io ok');"

@@ -55,6 +55,7 @@ typedef struct UrbcRuntime {
     List *stack;
     List *host_bindings;
     List *owned_callbacks;
+    List *owned_ffi_descriptors;
     List *owned_externals;
     int owns_exec;
     int owns_stack;
